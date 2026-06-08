@@ -175,6 +175,43 @@ The output is a machine-readable (JSON/TOML) and human-readable (Markdown) docum
 
 For DO-178C Level A software, this replaces a significant fraction of the structural coverage analysis and WCET evidence that currently requires specialised tooling and manual review. The compiler is the analysis tool, the source annotation is the specification, and the build is the proof. The certification artefact is not generated after the fact — it is a direct output of the development process.
 
+### The timing contract is cryptographically sealed — it cannot be spoofed at load time
+
+The compliance artefact alone does not prevent a tampered binary from claiming a timing contract it did not compile against. A binary that was recompiled with wider cycle budgets, or a manifest that was edited after the fact to show smaller worst-case numbers, would silently pass a naive load-time check. The cryptographic seal closes this gap.
+
+At build time, the proc-macro assembles a **signed manifest** embedded in the binary. The manifest contains:
+
+- The application name and declared subscription list
+- The full timing contract: every annotated function, its declared budget, its verified worst-case cycle count, its core assignment, and its margin
+- The SHA-256 hash of the compiled binary
+
+The build system signs this manifest with an Ed25519 private key held in CI. The corresponding public key is pinned in `system.cap`:
+
+```toml
+[system]
+trusted_build_key = "ed25519:AAAA..."
+```
+
+The loader verifies the manifest signature against this pinned public key before mapping any segment of the binary. An attacker who wants to run a binary with a falsified timing contract faces an impossible constraint: they must produce a manifest that (a) contains the falsified cycle budgets, (b) contains the correct SHA-256 hash of their binary, and (c) is signed by the CI private key — which they do not have. A binary recompiled with looser budgets will have a valid content hash but no valid signature. A manifest copied from a legitimate binary will have a valid signature but the wrong content hash. There is no combination that passes all three checks without the private key.
+
+The private key never leaves CI. Key rotation is a one-line change to `system.cap` — a visible, reviewable diff in version control. There is no runtime trust negotiation, no certificate authority, no OCSP check. The trust chain is: source → CI build → signed manifest embedded in binary → pinned public key in `system.cap` → loader verification → execution. Every link is static and produces a visible artefact. The timing contract that the compliance document reports is the same timing contract the loader enforces — cryptographically identical, by construction.
+
+**This is the proof the certification body receives.** A DO-178C auditor, an IEC 61508 assessor, or a regulator reviewing the system does not have to trust that the compliance document was generated honestly or that it accurately reflects the deployed binary. They verify the Ed25519 signature on the manifest against the published public key. If the signature is valid, three things are simultaneously proven:
+
+1. The binary was built by the authorised CI system holding the private key — it was not compiled by an attacker, a developer workstation, or an unknown toolchain.
+2. The timing contract in the manifest — every declared budget, every verified worst-case cycle count, every margin — was produced by the same build that produced the binary. It was not edited after the fact.
+3. The binary has not been modified since it was signed — any tampering invalidates the content hash inside the manifest, which invalidates the signature.
+
+The compliance document is not a report that claims the binary meets its timing contract. It is a cryptographically verifiable statement that the binary was built correctly and the stated numbers are unfalsified. The auditor's job, which today involves re-running WCET tools, comparing tool outputs to source, and tracing the chain from specification to binary, collapses to a single signature verification. The proof is machine-checkable, reproducible, and requires no trust in the developer or the development process — only in the public key, which is version-controlled and auditable at every rotation.
+
+**The kernel itself becomes compliant.** The clock-aware model does not stop at the application boundary. If the kernel's own circuits — IRQ handlers, RCU reclaim, memory management, the management plane — carry `#[timeslice]` annotations and are built by the same proc-macro checker, the kernel binary receives the same signed manifest with the same verified timing contract. The kernel is a clock-aware application in its own right. The certification body receives a cryptographically verifiable timing proof not just for the application, but for the entire software stack from kernel circuit to application circuit. There is no trusted black box beneath the verified code. Every annotated function in every layer — kernel, runtime, application — is covered by the same proof, bound into the same signed manifest, verifiable with the same public key. For safety-critical domains (avionics, automotive, industrial), this closes the gap that has always existed between "we verified the application" and "we trust the OS beneath it." Under clock-aware programming, trust is not assumed for the OS — it is proven, with the same mechanism, at the same build step.
+
+**This is something that has never existed in software engineering.** Every programming discipline that calls itself "hardware-aware" — DPDK, XDP, HFT tuning, real-time systems, kernel bypass networking — reasons about the hardware directly: cache line sizes, NUMA domains, execution port pressure, memory access latency. But every one of these disciplines treats the OS as a ghost in the model: present, necessary, but outside the proof. The programmer knows the CPU executes in 4 cycles and the NIC DMA completes in 200 ns, but the OS is an assumption — "it won't preempt here because we set `isolcpus`", "the IRQ won't fire here because we set `irqaffinity`", "the RCU grace period won't stall here because we set `rcu_nocbs`". These are configuration disciplines that approximate what a proof would provide. They are not proofs.
+
+Clock-aware programming closes the stack. The hardware timing model (the microarchitecture spec consumed by `llvm-mca`) is the foundation. The OS circuits above it are verified against that model with `#[timeslice]` annotations. The application circuits above those are verified against the same model. The signed manifest covers all three layers. The certification body sees a single, coherent, cryptographically verifiable proof that spans from the silicon's timing behaviour to the application's declared cycle budgets — with the OS not assumed away but verified in place.
+
+The OS is not absent from the model, as it has always been in hardware-aware programming. It is not a trusted black box, as it has always been in safety-critical certification. It is a first-class participant in the proof — annotated, verified, and sealed into the same manifest as the hardware and the application. This is the property that makes the entire stack provably correct for the first time.
+
 ---
 
 ## Alternatives Rejected

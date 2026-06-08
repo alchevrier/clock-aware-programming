@@ -97,28 +97,86 @@ Clock-aware programming as a concept applies more broadly: the annotations, comp
 
 The partition model is the extreme end of the spectrum — the configuration for workloads where the OS must be structurally excluded, not just tuned.
 
-This is a **software partition enforced by kernel configuration**, not a hardware boundary. On a normal system, all cores share timeslices and receive interrupts freely. The partition is created by directing IRQs away from the app cores (`irqaffinity`), suppressing the scheduler tick on them (`nohz_full`), removing them from the RCU quiescent-state tracking loop (`rcu_nocbs`), and marking them as isolated from the load balancer (`isolcpus`). Together these mechanisms approximate what a hard hardware partition would enforce — but it is a configuration discipline, not a silicon guarantee.
+Both partitions are **cycle-compliant collections of self-regulating circuits** — there is no scheduler in either. A scheduler arbitrates contention; contention only exists between circuits whose timing is unknown. When every circuit declares its cycle window, there is no contention to arbitrate and therefore nothing to schedule. The OS partition is not "Linux with an annotated scheduler" — it is a set of independent kernel circuits (IRQ receivers, RCU reclaim, memory management, management plane), each self-regulating on declared timing and each dynamically parametrisable at cycle boundaries. They do not contend because their windows are declared non-overlapping. No arbitrator exists; none is needed.
+
+Crucially, **every hardware signal is a channel write in this model** — there are no special cases. A hardware interrupt does not preempt a running circuit; it deposits a signal into a `Channel<IrqSignal>`. A NIC frame does not trigger a poll-mode read loop; it arrives into a `Channel<NicFrame>`. The shared ring buffer between partitions is a `Channel<OsEvent>`. Every signal source — hardware interrupt, NIC, inter-partition boundary, timer — uses the same abstraction: a typed channel with a declared write cycle, consumed by the receiver at its next declared read cycle. No context switch. No handler invoked out of band. No polling distinction. The distinction between "interrupt", "poll", and "message" dissolves — because all three distinctions existed only because the timing of hardware signals was never declared. Declared timing collapses them into one thing: a channel.
+
+The physical boundary is enforced by kernel configuration: IRQs are directed to OS cores (`irqaffinity`), the scheduler tick is suppressed on app cores (`nohz_full`), RCU quiescent-state tracking is confined to OS cores (`rcu_nocbs`), and app cores are removed from the load balancer (`isolcpus`). These mechanisms enforce the boundary at runtime; the clock-aware annotations enforce correctness at compile time.
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                        System                               │
-│                                                             │
-│  OS Partition (cores 0–1)        App Partition (cores 2–7)  │
-│  ┌────────────────────────┐      ┌────────────────────────┐ │
-│  │ Linux scheduler        │      │ Timeslice-managed FSM  │ │
-│  │ IRQ handling           │      │ No OS intervention     │ │
-│  │ RCU, memory reclaim    │      │ Poll-mode NIC access   │ │
-│  │ Management plane       │      │ L1-pinned working set  │ │
-│  └────────────┬───────────┘      └──────────┬─────────────┘ │
-│               │   Shared ring buffer         │               │
-│               │   (declared address,         │               │
-│               └─────declared cycle)──────────┘               │
-└─────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│                             System                               │
+│                                                                  │
+│  OS Partition (cores 0–1)          App Partition (cores 2–7)     │
+│  ┌──────────────────────────┐      ┌──────────────────────────┐  │
+│  │ #[timeslice] IRQ circuit │      │ #[timeslice] FSM circuit  │  │
+│  │   ← Channel<IrqSignal>  │      │   ← Channel<NicFrame>     │  │
+│  │ #[timeslice] RCU reclaim │      │ L1-pinned working set     │  │
+│  │ #[timeslice] mem mgmt    │      │ No OS intervention        │  │
+│  │ #[timeslice] mgmt plane  │      │  (no scheduler)           │  │
+│  │  (no scheduler)          │      │                           │  │
+│  └────────────┬─────────────┘      └────────────┬─────────────┘  │
+│               │    Shared ring buffer             │               │
+│               │    (declared address,             │               │
+│               └──────declared cycle)──────────────┘               │
+└──────────────────────────────────────────────────────────────────┘
 
-Enforced by: isolcpus, nohz_full, irqaffinity, rcu_nocbs
+Every signal is a channel write — IRQ, NIC frame, ring buffer boundary, all identical
+Receiver reads at its next declared cycle — no preemption, no polling, no special cases
+Both partitions: independent self-regulating circuits, no arbitrator
+Boundary enforced by: isolcpus, nohz_full, irqaffinity, rcu_nocbs
 ```
 
-**Analogy:** ARM Processing System (OS) + Programmable Logic fabric (app) on a Xilinx Zynq — except the boundary is kernel configuration rather than silicon. On the FPGA, the PL fabric genuinely cannot be preempted by the PS; on the CPU, that property is approximated by routing all interrupts and scheduler decisions away from the app cores.
+**Analogy:** ARM Processing System (OS) + Programmable Logic fabric (app) on a Xilinx Zynq — except on the FPGA, the PS runs an undeclared-timing OS while only the PL is constrained. In the clock-aware model, both sides are collections of declared-timing circuits. The asymmetry is workload character (general-purpose kernel circuits vs. hard real-time trading circuit), not timing discipline. Neither side has a scheduler because neither side has unresolved contention. Hardware signals arrive as channel writes, not as preemptions — the same model as any other declared inter-circuit communication.
+
+---
+
+## Application Identity and Channel Subscriptions
+
+When every signal in the system is a `Channel<T>`, application access control falls out of the channel model for free. An application is not a process with a UID and a set of capabilities checked at runtime — it is a named circuit with a declared subscription list, verified at compile time.
+
+In `system.cap`:
+
+```toml
+[app.order-router]
+subscribes = ["nasdaq-feed", "itch-parser-out"]
+publishes  = ["order-decisions"]
+core       = 2
+budget_ns  = 4
+```
+
+The application declares:
+- **Its unique name** (`order-router`) — its identity in the system.
+- **What it reads** (`subscribes`) — the only channels its code is permitted to access.
+- **What it writes** (`publishes`) — the only channels its code is permitted to write.
+- **Where and when** (`core`, `budget_ns`) — its timing contract.
+
+The proc-macro checker reads the subscription list at compile time and verifies that every `Channel<T>::read()` call in the application's code refers to a declared-subscription channel, and every `Channel<T>::write()` call refers to a declared-publish channel. A read from an undeclared channel is a compile error — not an access denied at runtime, not a kernel permission check, not a capability lookup. The binary that is produced physically cannot read data it was not declared to read, because the compiler rejected the code that would have done so.
+
+**This is capability-based security without a capability runtime.** Traditional capability systems (seL4, CHERI, Linux capabilities) enforce access control at runtime: the kernel checks whether the calling process holds the capability before permitting the operation. The check has a cost, the capability table has a size, and a compromised process with valid capabilities is indistinguishable from a correct one. Here the enforcement is structural: the application's source code declares its access boundaries, the compiler proves every access is within those boundaries, and the resulting binary contains no instructions that could reach an undeclared channel — because no such instructions were emitted. There is nothing to check at runtime because the invariant is a property of the binary, not a runtime predicate.
+
+The unique name also provides system-wide traceability. Every channel write in the system is attributed to a named circuit. Every channel read is attributed to a named circuit. The full data flow of the system — which app produced what, which app consumed what, at what cycle — is statically knowable from the subscription graph in `system.cap`. There is no `strace`, no `tcpdump`, no runtime audit log needed to understand what data flowed where: the compiler already proved it, and the subscription graph is the proof.
+
+**An unknown application cannot run.** At load time, the system verifies every application binary against the channel registry derived from `system.cap`. An application binary carries its declared subscription list as a signed manifest — produced by the proc-macro at compile time, embedded in the binary, and bound to its content hash. The loader checks three things before executing a single instruction:
+
+1. **Every channel the binary references is in the registry** — unknown channels do not exist at runtime; they have no address, no buffer, no identity. A binary that references an undeclared channel cannot be mapped.
+2. **The subscription list in the manifest matches the subscription list in `system.cap`** — a binary compiled with access to `nasdaq-feed` cannot run on a system where `system.cap` does not grant that access to its named circuit.
+3. **The manifest signature is valid** — a tampered binary, a recompiled binary with a wider subscription list, or an injected binary without a manifest is rejected before any code runs.
+
+The signature scheme is the cryptographic seal that makes spoofing structurally impossible. At build time, the proc-macro assembles the manifest — the application name, the full subscription list, the publish list, the timing contract, and the SHA-256 hash of the compiled binary — and the build system signs this manifest with an Ed25519 private key held in CI. The corresponding public key is pinned in `system.cap`:
+
+```toml
+[system]
+trusted_build_key = "ed25519:AAAA..."
+```
+
+The loader verifies the manifest signature against this pinned public key before mapping any segment of the binary. An attacker who wants to run a binary with access to `nasdaq-feed` faces an impossible constraint: they must produce a manifest that (a) declares the `nasdaq-feed` subscription, (b) contains the correct SHA-256 hash of their binary, and (c) is signed by the CI private key — which they do not have. A binary compiled by the attacker with a forged subscription list will have a valid content hash but no valid signature. A manifest copied from a legitimate binary will have a valid signature but the wrong content hash. There is no combination that passes all three loader checks without the private key.
+
+The private key never leaves CI. The public key in `system.cap` is version-controlled and reviewed at commit time. Key rotation is a `system.cap` change — a one-line diff, auditable, with no runtime state to update. The entire trust chain is: source → CI build → signed manifest → pinned public key → loader verification → execution. Every link is static, inspectable, and produces a visible artefact. There is no runtime trust negotiation, no certificate authority, no OCSP check — the trust is established at build time and verified at load time, with nothing dynamic in between.
+
+An attacker who injects an application gains nothing: the channel they want to read (`nasdaq-feed`, `order-decisions`, `itch-parser-out`) has no runtime presence unless the system was configured to grant it. The configuration is static, signed, and verified at load time — not a runtime policy decision that can be bypassed. The attack surface is the configuration, not the running system. And the configuration is a text file in version control, audited at commit time, with a diff that makes any change immediately visible.
+
+This is the same security model as a hardware FPGA bitstream: an FPGA only implements the circuits it was synthesised for. An attacker cannot make the FPGA do something not in the bitstream. The clock-aware application model applies the same principle in software: the system only runs circuits whose channel subscriptions are declared, verified, and signed into the binary. Everything else is rejected at the boundary, before execution, by construction.
 
 ---
 
@@ -137,6 +195,8 @@ Feedback loop target:  write → IDE annotation (instantaneous)
 ```
 
 The goal is the same feedback loop a hardware engineer has in Vivado: timing violations are visible as you type, not discovered after a build.
+
+Because the proc-macro checker runs as part of the normal build, any language server (rust-analyzer) that invokes the build surfaces violations as red underlines in the editor — before a build is triggered, before a binary exists, before anything runs. A `#[timeslice]` annotation that exceeds its budget, a channel subscription that references an undeclared channel, a dependency whose timing contract is incompatible — all are compile errors, visible at edit time. The question "will this work at runtime?" is answered on every keystroke. The proof runs first; the binary is a consequence of the proof passing.
 
 ---
 
@@ -186,9 +246,13 @@ The ideas here were motivated by HFT and derived from FPGA work, but the missing
 
 **Embedded systems** — Microcontrollers and RTOSes live with the same tradeoffs: FreeRTOS tasks have priorities and preemption because task duration is unknown; interrupt service routines are short and deferred because their timing conflicts with the main loop are unresolved at compile time; power management is heuristic because the system cannot predict when the next operation will run. Clock-aware annotations would make all of this static: task duration verified at compile time, ISR scheduling provably non-conflicting, sleep cycles declared rather than estimated.
 
+More fundamentally, clock-aware programming with an app-only topology eliminates the RTOS entirely. Writing embedded firmware today requires simultaneous, unassisted reasoning across layers no single tool unifies: the hardware timing model (datasheet, reference manual, errata), the interrupt priority table, the linker script, the RTOS task model, and the application logic — all held in the programmer's head at once. An interrupt at the wrong priority silently corrupts state. A task that runs longer than its budget silently violates the assumption of the task below it. None of these are compile errors. All of them are discovered on hardware, often in the field. Clock-aware programming replaces all of this with declarations: circuits, channels, cycle budgets, subscriptions — verified at compile time, visible in the IDE, sealed into a signed manifest. There is no interrupt priority table because hardware signals arrive as channel writes. There is no linker script to tune because the working set is declared. There is no RTOS scheduler because there is no contention to arbitrate. The mental bending is not intrinsic to embedded programming — it is the price of having no unified model.
+
 **Mobile development** — Frame rendering, touch latency, audio callbacks, and background work all compete on a shared scheduler that cannot see across their boundaries. Jank, audio glitches, and battery drain under light load are symptoms of the same unknowing: the runtime arbitrates between operations whose timing was never declared. A clock-aware model would let the compiler prove that an audio callback completes within its 5 ms window, that a frame's render work finishes before the display's vsync deadline, and that background tasks back off precisely when foreground work begins — without the heuristics, tuning, and platform-specific workarounds that currently make mobile performance engineering an empirical discipline.
 
-**Real-time systems and safety-critical software** — DO-178C, IEC 61508, and AUTOSAR all require worst-case execution time (WCET) analysis, typically done with external tools against pre-compiled binaries. Clock-aware annotations would make WCET a first-class compile-time output, not a post-hoc measurement — the certification artefact becomes a property of the source code, not of one specific compiled binary on one specific hardware configuration.
+**Real-time systems and safety-critical software** — DO-178C, IEC 61508, and AUTOSAR all require worst-case execution time (WCET) analysis, typically done with external tools against pre-compiled binaries. Clock-aware annotations would make WCET a first-class compile-time output, not a post-hoc measurement — the certification artefact becomes a property of the source code, not of one specific compiled binary on one specific hardware configuration. Crucially, the compliance document is cryptographically bound to the binary via a signed manifest: the certification body can verify with a single signature check that the timing numbers in the document are the same ones sealed into the deployed binary, and that the binary was produced by the authorised build system. Trust is not assumed for the OS beneath the application — the kernel's own circuits carry the same annotations and are covered by the same manifest. The entire stack is provably correct for the first time.
+
+**AI-assisted development** — AI code generation tools fail at embedded and systems code for a structural reason: the correctness constraints are implicit. Interrupt priorities, stack sizes, linker section placement, RTOS task budgets, hardware timing relationships — none of these are in the source code. They are in datasheets, reference manuals, and tribal knowledge the AI cannot see or verify. The AI generates plausible code; whether it is correct on the specific hardware is discovered at runtime, often after flashing. In a clock-aware model, every constraint is explicit and machine-readable: `system.cap` declares the hardware model and channel graph, `#[timeslice]` annotations declare cycle budgets, subscriptions declare access boundaries. The compiler emits precise, local errors: "budget exceeded by 2 cycles on port 1", "channel `nic-rx` not in subscription list". The AI's feedback loop becomes: generate → compile → read precise error → fix → compile again. No hardware. No flashing. No guessing. Clock-aware programming is the first systems model that is genuinely legible to an AI code generator — not because the AI got smarter, but because the model stopped hiding information from it.
 
 **Garbage collection** — A clock-aware GC would be the most efficient GC ever built. Today's GC designs — generational, concurrent, incremental, ZGC, Shenandoah — all exist to manage one fundamental problem: the collector does not know when the mutator will next access a given object, so it must either stop the world (pause) or use complex concurrent barriers to stay correct while the mutator runs. Every GC barrier, every write barrier, every remembered set, every card table entry is a runtime mechanism for tracking what the compiler could have declared statically.
 
