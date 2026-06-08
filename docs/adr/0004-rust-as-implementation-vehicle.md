@@ -33,6 +33,66 @@ Specifically:
 
 ## Rationale
 
+### The verification model: four rules against the declared budget
+
+When the proc-macro encounters a `#[timeslice(budget_ns = B)]` annotation on a function, it compiles the function body, invokes `llvm-mca` with the declared `cpu_model`, and evaluates four rules against the declared budget. All four must pass for the annotation to be accepted. Any failure is a compile error.
+
+**Rule 1 — ALU cost.** For each instruction in the compiled function body, the checker looks up its latency and throughput from the microarchitecture model (Intel Optimization Reference Manual, AMD Software Optimization Guide, or ARM Cortex TRM — all consumed by `llvm-mca`). The sum of ALU instruction latencies along the critical path must not exceed the declared budget:
+
+```
+Σ(latency(instr_i) for instr_i on critical path) ≤ budget_cycles
+```
+
+**Rule 2 — Memory access cost.** Load and store instructions have declared latency from the cache hierarchy. For an L1-pinned working set, load latency is 4–5 cycles (L1 hit), store latency is 1 cycle (store buffer). The checker verifies that all memory accesses in the function are to declared working-set addresses and their latency is accounted for in the budget. An access that would miss L1 — because the address is outside the declared working set — is a compile error, not a runtime cache miss.
+
+**Rule 3 — Port contention.** Modern CPUs have a fixed number of execution ports. Each instruction type is dispatched to a specific port (or set of ports). If two instructions in the same cycle window compete for the same port, one must wait — adding cycles to the actual execution time that the nominal latency sum does not capture. `llvm-mca` models port pressure precisely per microarchitecture. The checker verifies that the instruction mix in the function does not create port contention that causes the actual throughput to exceed the declared budget. If it does, the annotation is rejected: the programmer must either widen the budget, reorder the instruction mix, or add a `#[pipeline]` annotation to spread the work across stages.
+
+**Rule 4 — Pipeline initiation interval.** For functions annotated with `#[pipeline(ii = N)]`, the checker verifies that the declared II is achievable: that no loop-carried dependency chain is longer than N cycles, and that port utilisation across the II window does not exceed 100% on any port. This is the direct equivalent of HLS II verification. A function that declares `ii = 1` but has a 3-cycle loop-carried dependency is rejected at compile time — not discovered at simulation, not measured at runtime.
+
+Together these four rules implement the same verification that Vivado performs during HLS synthesis: given this microarchitecture model, given this instruction mix, given these resource constraints — does the declared timing close? The answer is yes or no, at compile time, with a precise error message identifying which rule failed and by how many cycles. The programmer fixes the code or widens the budget. The process is timing closure, in software.
+
+### Code structure mirrors SystemVerilog dataflow — channels as wires, functions as modules
+
+SystemVerilog describes hardware as dataflow: modules consume input ports and produce output ports, connected by wires. The structure is declarative — the designer describes what flows where, not how the scheduler moves data. A NASDAQ feed handler in SystemVerilog or HLS is a pipeline of stages connected by channels:
+
+```
+parse_event → handle_event → update_snapshot
+```
+
+Clock-aware Rust expresses the same structure identically:
+
+```rust
+#[timeslice(core = 2, cycle = N, budget_ns = 4)]
+#[pipeline(stages = 3, ii = 1)]
+fn kernel(raw_in: &Channel<RawMessage>, out: &Channel<BookSnapshot>) {
+    update_snapshot(handle_event(parse_event(raw_in)), out);
+}
+```
+
+`Channel<T>` is a typed, declared-timing conduit — not a thread-safe queue with a lock, not an async future with a waker, but a direct analogue of an HLS `hls::stream<T>`: a channel whose read and write cycles are declared and verified by the timeslice checker. `parse_event`, `handle_event`, and `update_snapshot` are pipeline stages, each with its own `#[timeslice]` annotation declaring its cycle budget. Their composition — `update_snapshot(handle_event(parse_event(...)))` — is the data path, expressed as function composition exactly as it would be expressed in HLS.
+
+The consequence: a clock-aware Rust program reads like a hardware description, because it *is* a hardware description — of the architecture above the silicon. The compiler is the synthesis tool. The annotations are the constraints. The channel types enforce that data flows only between declared-compatible cycle windows, the same way HLS FIFO depth constraints enforce that a producer does not overflow a consumer. The mental model the programmer uses is identical to the mental model used in Vitis HLS — because the underlying abstraction is the same: a pipeline of typed stages connected by declared-timing channels, verified at compile time.
+
+This is not a stylistic preference. It is the correct abstraction for a clock-aware system. Software written in this style is directly portable to an in-order clock-aware CPU (ADR-0009) because it already describes a pipeline with declared throughput — the hardware just needs to execute what the compiler has already proven correct.
+
+### Proc-macro annotations mirror HLS directives — and that is intentional
+
+HLS tools (Vitis HLS, Bambu, Catapult) use directives — pragmas or attributes placed in source code — to declare pipeline behaviour, initiation interval, loop unrolling, and resource allocation. These are not hints; they are constraints the synthesis tool verifies and enforces. A function marked `#pragma HLS PIPELINE II=1` that cannot achieve II=1 fails synthesis. The pragma is a contract, not a comment.
+
+Rust proc-macros implement the same model for software:
+
+```rust
+#[timeslice(core = 2, cycle = N, budget_ns = 4)]
+#[pipeline(stages = 3, ii = 1)]
+fn process_order(book: &OrderBook) -> Decision { ... }
+```
+
+`#[timeslice]` declares when this function executes and for how long — equivalent to HLS `set_max_delay` and `PIPELINE II`. `#[pipeline]` declares the number of pipeline stages and the initiation interval — equivalent to HLS loop pipelining directives. Both are compile-time contracts: the proc-macro invokes `llvm-mca` on the compiled function body, verifies the declared cycle budget and II against the actual instruction mix, and emits a compile error on violation. Not a warning. Not a runtime assertion. A compile error — the same enforcement model as HLS timing closure.
+
+The parallel is not superficial. HLS directives work because the synthesis tool has full visibility into the hardware schedule. Rust proc-macros work because the compiler has full visibility into the instruction schedule. In both cases, the annotation is the contract, the tool is the verifier, and violation is a build failure. The discipline that Vivado enforces on FPGA designs is exactly what this annotation system enforces on software — the same contract, the same enforcement, different silicon.
+
+`#[pipeline]` in particular makes the FSM execution model of ADR-0002 concrete. A pipeline with declared stages and II=1 is a software pipeline that processes one new input per cycle — the same initiation interval guarantee that HLS achieves in hardware. The compiler proves the instruction mix fits within the declared stage count and produces no structural hazards. The result is a software function with the throughput properties of an FPGA pipeline, running on a CPU that trusts the declared schedule.
+
 ### The borrow checker already proves the invariant RCU enforces
 
 Rust's borrow checker proves read/write exclusivity at compile time: a mutable reference (`&mut T`) cannot coexist with any other reference to the same data. This is structurally the same guarantee RCU provides at runtime — a reader will not observe a partially-written value.
@@ -46,9 +106,8 @@ Building on an existing, sound proof system is feasible. Building a new one from
 Rust lifetimes encode validity ranges for references. A timeslice annotation fits naturally as a lifetime bound:
 
 ```rust
-fn read_order_book<'timeslice(core=2, cycle=N)>(
-    book: &'timeslice OrderBook
-) -> BestBid { ... }
+#[timeslice(core = 2, cycle = N, budget_ns = 4)]
+fn read_order_book(book: &OrderBook) -> BestBid { ... }
 ```
 
 The annotation reads: "this reference is valid during cycle N on core 2." The type system can reason about whether two such references with different cycle annotations can coexist — which is exactly the proof needed for RCU elimination.
@@ -70,6 +129,51 @@ Rust-for-Linux is different:
 - A proc-macro crate implementing the timeslice checker can be developed, tested, and reviewed entirely outside the kernel tree, then presented to the kernel community with a working proof-of-concept patch.
 
 The contribution path is: proc-macro crate (standalone) → kernel patch replacing one RCU critical section → RFC to `rust-for-linux` mailing list. This is a real sequence with known actors, not a theoretical path.
+
+### Proc-macros ship as an independent crate — no Rust committee involvement
+
+This is a practical and significant advantage of the proc-macro approach. A proc-macro is a compiler plugin expressed as a standard Rust crate. It lives in its own repository, has its own version, compiles against stable Rust, and is distributed via `crates.io`. There is no language change proposal, no RFC to the Rust lang team, no waiting for stabilisation, no committee review.
+
+The timeslice checker, the `#[timeslice]`, `#[pipeline]`, and `#[no_rcu]` attributes, the `llvm-mca` integration, and the `Channel<T>` type are all implementable as a crate today, on stable Rust, independently of any language evolution. Users add the crate as a dependency and the annotations become available immediately. If the design evolves — new attributes, refined verification rules, updated microarchitecture models — the crate is updated and versioned independently.
+
+This is the right delivery model for a new primitive: prove it works as a library before proposing it as a language feature. If the crate gains adoption and the community finds the model sound, the path to a formal language proposal opens from a position of demonstrated utility rather than theoretical argument. The proc-macro is not a workaround — it is the correct first step.
+
+### Crates declare their timing contracts — incompatible crates are rejected at compile time
+
+A clock-aware crate is not just a library — it is a timing contract. A crate that exposes functions annotated with `#[timeslice]` declares, as part of its public API, the cycle budget and core assignment those functions require. Any crate that depends on it must declare compatible timing — if the dependency's declared cycle window overlaps with the caller's window, or if the dependency's budget exceeds the caller's remaining budget, the timeslice checker rejects the dependency at compile time.
+
+This extends the proc-macro verification across the full dependency graph. In `Cargo.toml`:
+
+```toml
+[dependencies]
+order-book = { version = "1.2", timeslice = { core = 2, max_budget_ns = 2 } }
+```
+
+The `timeslice` field is a compile-time constraint on the dependency: "I will use this crate from core 2 and it must fit within 2 ns." If `order-book 1.2` declares its hot path at 2.5 ns, the dependency is rejected — not at link time, not at runtime, but when Cargo resolves the dependency graph. The error is: "order-book 1.2 declares budget_ns = 2.5, which exceeds the declared constraint of 2.0 for core 2."
+
+The practical consequence is that the crate ecosystem becomes timing-safe by construction. A crate that ships a timing regression — a new version whose hot path exceeds its declared budget — cannot be pulled into a clock-aware binary without an explicit budget acknowledgement from the consumer. This is the same guarantee Rust's type system provides for memory safety, extended to timing: an incompatible dependency is a compile error, not a runtime surprise discovered in production at 3am.
+
+The dependency resolver also propagates the budget constraint transitively: if crate A depends on crate B which depends on crate C, the checker verifies that the sum of declared budgets across the call chain fits within the top-level timeslice window. A chain that exceeds the budget is rejected at the root, with a precise error identifying which dependency in the chain caused the violation and by how many cycles.
+
+### The build produces a compliance artefact automatically
+
+For safety-critical systems — DO-178C (avionics), IEC 61508 (industrial safety), AUTOSAR (automotive), or any domain requiring formal worst-case execution time evidence — the certification body requires proof that the declared timing is met. Today that proof is produced by external WCET analysis tools (AbsInt aiT, RapiTime, Bound-T) running against a pre-compiled binary on a specific hardware configuration. The proof is post-hoc, binary-specific, and must be regenerated for every code change and every target hardware revision.
+
+Under the clock-aware model, the proof is a build output. The proc-macro checker, as a by-product of compilation, emits a structured timing report: for each annotated function, the declared budget, the verified worst-case cycle count from `llvm-mca`, the margin, the core assignment, the memory access profile, and the dependency chain. This report is not a test result — it is a compile-time certificate. It cannot be produced if the build fails, and the build fails if any timing constraint is violated. The certificate and the binary are produced by the same invocation and are structurally inseparable.
+
+No modification to Cargo or rustc is required. The mechanism uses two extension points that already exist:
+
+1. **Proc-macro side effects.** A proc-macro executes at compile time during macro expansion and has full access to `std::fs`. For every annotated function, the timeslice checker writes a per-function timing record — declared budget, verified worst-case cycle count, margin, core assignment, memory profile — to `target/timeslice/<crate>/<function>.json`. This is a side effect of the normal `cargo build`.
+
+2. **Cargo subcommand extensibility.** Any binary named `cargo-X` on `$PATH` is invocable as `cargo X` without any Cargo modification. The second crate in the ecosystem, `cargo-timeslice`, is a CLI binary that reads `target/timeslice/` and aggregates the per-function records into the final report. Invoked as:
+
+```
+cargo timeslice report
+```
+
+The output is a machine-readable (JSON/TOML) and human-readable (Markdown) document stating: "function `process_order` on core 2, declared budget 4 ns, verified worst-case 3.1 ns, margin 0.9 ns, llvm-mca model skylake, dependency chain [parse_event: 1.2 ns, handle_event: 0.9 ns, update_snapshot: 1.0 ns], L1-pinned working set confirmed." This document is the certification artefact. It is reproducible — the same source, the same `cpu_model`, and the same crate versions always produce the same report. It is traceable to source — every annotated function in the report corresponds to a specific line in a specific file at a specific commit. It is complete — every timing-annotated code path in the binary is covered, with no unannotated paths permitted in `#[no_rcu]` or `#[no_barrier]` contexts.
+
+For DO-178C Level A software, this replaces a significant fraction of the structural coverage analysis and WCET evidence that currently requires specialised tooling and manual review. The compiler is the analysis tool, the source annotation is the specification, and the build is the proof. The certification artefact is not generated after the fact — it is a direct output of the development process.
 
 ---
 

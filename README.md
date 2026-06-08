@@ -162,6 +162,21 @@ These ADRs form the whitepaper. Each records a single decision: the problem it s
 | [0006](docs/adr/0006-poll-mode-self-regulating-network-stack.md) | Poll-mode self-regulating network stack | Accepted |
 | [0007](docs/adr/0007-memory-ordering-elimination.md) | Memory ordering elimination via compile-time scheduling proofs | Accepted |
 | [0008](docs/adr/0008-clock-aware-memory-management.md) | Clock-aware memory management | Accepted |
+| [0009](docs/adr/0009-implied-hardware-architecture.md) | The implied hardware architecture | Speculative |
+
+---
+
+## The Implied Hardware Destination
+
+Clock-aware programming is designed to run on existing commodity CPUs. But the model has a logical hardware endpoint that is worth stating explicitly, because it determines where the compounding value lives.
+
+Every piece of hardware in a modern CPU that does not perform computation exists to compensate for not knowing the schedule: the out-of-order engine, the branch predictor, the ROB, the speculative execution machinery, the L2 and L3 cache hierarchy. A CPU designed for a software model that *declares* its schedule has no use for any of it. The compiler already scheduled optimally from the declared dependency graph. The branch-free hot path has no branches to predict. The L1-pinned working set has no misses for L2 and L3 to absorb.
+
+The freed die area — L2 and L3 together consume 50–70% of a modern CPU die; the OOO engine and branch predictor consume much of the rest — is reinvested into execution ports, wider SIMD, more cores, and higher clock frequency. The memory model simplifies to TSO or stronger by construction, eliminating residual barriers and enabling full RCU elimination without architecture-dependent caveats.
+
+The compounding gain comes from transistor scaling. As transistors shrink, every process node amplifies the freed area. An OOO CPU at 3nm is faster than at 5nm by a predictable factor. A clock-aware in-order CPU at 3nm is faster by a larger factor, because it reinvests *more* of the node's transistor budget into computation rather than prediction. The FPGA is the existence proof: FPGAs are in-order by construction, and every process generation has delivered gains directly into logic density and clock rate, not into prediction hardware.
+
+This is not a requirement for the software model — which works on Skylake today. It is the destination the model implies, and the reason the primitive has value that compounds rather than saturates. See [ADR-0009](docs/adr/0009-implied-hardware-architecture.md).
 
 ---
 
