@@ -36,6 +36,9 @@ Example schema (TOML):
 ```toml
 [system]
 cpu_model = "skylake"
+baseline  = "skylake-server"   # named microarchitecture profile; sets defaults
+                               # for cpu_model, port topology, L1/L2 latencies,
+                               # store buffer depth, and nominal frequency range
 
 [os_partition]
 cores = [0, 1]
@@ -44,7 +47,7 @@ cores = [0, 1]
 cores = [2, 3, 4, 5, 6, 7]
 working_set = "L1"        # compiler enforces: declared data must fit in L1
 huge_pages = 512          # 1 GB total (512 × 2 MB)
-cpu_freq_mhz = 3600       # pinned; no turbo, no power states
+cpu_freq_mhz = 3600       # pinned; overrides baseline nominal if set; no turbo, no power states
 
 [boundary]
 ring_buffer_paddr = "0x200000000"   # physical address, 2 MB aligned
@@ -52,6 +55,21 @@ ring_buffer_size  = "2MB"
 os_write_cycle    = 1000            # OS partition writes every 1000 cycles
 app_read_cycle    = 500             # app partition reads every 500 cycles
 ```
+
+The `baseline` field selects a named microarchitecture profile shipped with the `timeslice-macros` crate. Each profile encodes the full microarchitectural characterisation the toolchain needs: the `llvm-mca` target CPU string, the execution port topology (which ports handle which instruction classes), L1 hit latency, store-to-load forwarding latency, store buffer depth, and the nominal frequency range for which the profile is valid. A developer who declares `baseline = "skylake-server"` does not need to know any of these numbers — the profile holds them. `cpu_freq_mhz` is an override: if the pinned frequency differs from the baseline nominal (e.g., pinned at 3200 MHz on a chip with a 3600 MHz nominal), the override adjusts the `budget_ns` → `budget_cycles` conversion without changing the underlying microarchitecture model.
+
+Predefined baselines ship with the crate and are versioned alongside it:
+
+| Baseline | `llvm-mca` target | Nominal MHz | Notes |
+|---|---|---|---|
+| `skylake-server` | `skylake-avx512` | 3600 | Xeon Scalable Gen 1/2 |
+| `icelake-server` | `icelake-server` | 3200 | Xeon Scalable Gen 3 |
+| `zen4-server` | `znver4` | 3700 | EPYC Genoa |
+| `zen5-server` | `znver5` | 3900 | EPYC Turin |
+| `neoverse-n2` | `neoverse-n2` | 3000 | ARM Graviton 4 |
+| `cortex-a55` | `cortex-a55` | 1800 | Common embedded core |
+
+Adding a new baseline is a crate contribution — the profile is a TOML or JSON file in the crate's `baselines/` directory, auditable, versioned, and referenced by the compliance artefact. The certification body can inspect exactly which profile was used, verify it matches the deployed hardware, and confirm the llvm-mca model is appropriate for that silicon.
 
 From this file:
 

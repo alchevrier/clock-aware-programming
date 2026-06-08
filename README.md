@@ -219,7 +219,8 @@ These ADRs form the whitepaper. Each records a single decision: the problem it s
 | [0003](docs/adr/0003-rcu-elimination-via-compile-time-proofs.md) | RCU elimination via compile-time scheduling proofs | Accepted |
 | [0004](docs/adr/0004-rust-as-implementation-vehicle.md) | Rust as implementation vehicle | Accepted |
 | [0005](docs/adr/0005-unified-system-configuration.md) | Unified system configuration file | Accepted |
-| [0006](docs/adr/0006-poll-mode-self-regulating-network-stack.md) | Poll-mode self-regulating network stack | Accepted |
+| [0006](docs/adr/0006-poll-mode-self-regulating-network-stack.md) | Poll-mode self-regulating network stack | Superseded by 0010 |
+| [0010](docs/adr/0010-channel-based-io.md) | Channel-based I/O — hardware signals as declared-timing channels | Accepted |
 | [0007](docs/adr/0007-memory-ordering-elimination.md) | Memory ordering elimination via compile-time scheduling proofs | Accepted |
 | [0008](docs/adr/0008-clock-aware-memory-management.md) | Clock-aware memory management | Accepted |
 | [0009](docs/adr/0009-implied-hardware-architecture.md) | The implied hardware architecture | Speculative |

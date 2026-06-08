@@ -1,7 +1,9 @@
 # ADR-0006: Poll-Mode Self-Regulating Network Stack
 
 **Date:** 2026-06-07  
-**Status:** Accepted
+**Status:** Superseded by [ADR-0010](0010-channel-based-io.md)
+
+> **Note:** This ADR described the network receive path as a poll-mode ring buffer loop. That framing has been superseded by the unified channel model: the NIC is `Channel<NicFrame>`, IRQs are `Channel<IrqSignal>`, and all hardware signal sources are declared-timing channels. The self-regulation mechanism is retained but reframed as depth-driven budget adjustment. See ADR-0010 for the current model.
 
 ---
 
