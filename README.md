@@ -1,4 +1,4 @@
-# Clock-Aware Programming
+# Clock-Aware Programming by Alex Chevrier - chevrier.alex@gmail.com 
 
 > Static scheduling as a first-class language primitive: clock-aware annotations that let the compiler prove synchronisation unnecessary.
 
