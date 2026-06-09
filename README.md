@@ -39,7 +39,7 @@ CPUs are not deterministic — but only because we never tell them to be. Under 
 | Working set declared and pinned in L1 (< 32 KB) | `mlock`, huge pages, prefetch annotations |
 | Dedicated isolated core | `isolcpus`, `nohz_full`, `irqaffinity`, `rcu_nocbs` |
 | Branch-free hot path | Compiler intrinsics, profile-guided branch elimination |
-| Poll-mode I/O | DPDK/XDP, no interrupt delivery to the hot core |
+| Channel-based I/O | Every hardware signal is `Channel<T>`; declared write rate, declared read cycle, no interrupt delivery to app cores |
 
 Under these preconditions: **cycle count is a pure function of instruction mix × CPU microarchitecture model — computable at compile time.**
 
@@ -53,11 +53,11 @@ That makes the clock a first-class compiler concept. A program that declares its
 
 2. **Lock-free by construction** — Locks exist because of temporal uncertainty. Remove the uncertainty and ordering is guaranteed by schedule, not runtime serialisation. A compiler that knows core 2 reads at cycle N and core 0 writes at cycle N+K where K > read latency has proved the ordering. No lock needed.
 
-3. **FSM execution model** — The app partition is a finite state machine: declared states, deterministic transitions, no preemption. The OS partition is a black box that produces inputs at declared rates via a ring buffer boundary. This is exactly the PS/PL split on a Zynq — except it runs on a commodity server.
+3. **FSM execution model** — The app partition is a finite state machine: declared states, deterministic transitions, no preemption. The OS partition is not a black box — it is a collection of declared-timing circuits (IRQ handlers, RCU reclaim, memory management), each writing into typed `Channel<T>` conduits that the app partition reads at declared cycles. This is exactly the PS/PL split on a Zynq — except both sides are clock-aware, not just the PL fabric.
 
 4. **Unified system configuration** — Today, isolating a core requires `isolcpus=2-7 nohz_full=2-7 irqaffinity=0,1 rcu_nocbs=2-7` scattered across boot parameters, systemd unit files, and NUMA policy scripts. One declarative config file replaces all of it and scopes the compiler's verification domain.
 
-5. **Self-regulating network stack** — Eliminates the `hardirq → softirq → sk_buff → socket` chain. The NIC is a memory-mapped ring buffer polled at a declared cycle interval. Poll rate self-regulates on ring depth: deep ring → poll faster; empty ring → back off. No kernel involvement on the hot path.
+5. **Channel-based I/O eliminates the network stack** — Eliminates the `hardirq → softirq → sk_buff → socket` chain. The NIC is `Channel<NicFrame>`: hardware DMA writes frames directly into the declared channel buffer; the circuit reads at its declared cycle. There is no poll loop, no interrupt, no scheduler involvement — the distinction between interrupt, poll, and message dissolves when receive timing is declared. The circuit's channel depth drives its own cycle budget: deep channel → run sooner; empty channel → run later. No kernel involvement on the hot path. Latency bound is a compile-time theorem, not a runtime measurement.
 
 6. **The scheduler becomes unnecessary** — The scheduler exists because the OS does not know when tasks will complete; it arbitrates contention between them by preemption. But the scheduler can only arbitrate *contention* — and contention only exists between circuits that share time without declaring it. Under clock-aware programming, every circuit in the kernel is independent and self-regulating by declared clock cycles: each occupies non-overlapping cycle windows, self-regulates on load within its own declared budget, and does not compete with any other circuit for CPU time because competition requires temporal ambiguity. Independent circuits with declared, non-overlapping windows have no contention to arbitrate. This applies not just to user processes but to the kernel itself: softirqs, RCU callbacks, kthreads, and workqueues are all scheduled because their timing is unknown and they implicitly contend. Make every circuit's timing explicit and the contention dissolves by construction — not because the scheduler became smarter, but because the condition that required arbitration no longer exists. The scheduler is not replaced by a better scheduler; it is replaced by the absence of the condition that made one necessary.
 
@@ -91,7 +91,7 @@ A kernel built on these principles — not as a research experiment but as a pro
 
 ## CPU Partition Model
 
-This architecture — isolated cores, poll-mode NIC, ring buffer boundary, `isolcpus`/`nohz_full` — is specifically for **HFT-class and hard real-time workloads** where the cost of a single scheduler preemption or IRQ delivery is unacceptable. Normal workloads do not need it and should not use it.
+This architecture — isolated cores, channel-based I/O, declared-timing circuits, `isolcpus`/`nohz_full` — is specifically for **HFT-class and hard real-time workloads** where the cost of a single scheduler preemption or IRQ delivery is unacceptable. Normal workloads do not need it and should not use it.
 
 Clock-aware programming as a concept applies more broadly: the annotations, compile-time timing proofs, memory ordering elimination, and RCU elision are useful for any workload that benefits from statically verified timing. But those benefits do not require dedicated isolated cores. A web server or database annotating its hot path gets compile-time cycle budgets and provably unnecessary barriers without partitioning a single core away from the OS.
 
@@ -220,10 +220,10 @@ These ADRs form the whitepaper. Each records a single decision: the problem it s
 | [0004](docs/adr/0004-rust-as-implementation-vehicle.md) | Rust as implementation vehicle | Accepted |
 | [0005](docs/adr/0005-unified-system-configuration.md) | Unified system configuration file | Accepted |
 | [0006](docs/adr/0006-poll-mode-self-regulating-network-stack.md) | Poll-mode self-regulating network stack | Superseded by 0010 |
-| [0010](docs/adr/0010-channel-based-io.md) | Channel-based I/O — hardware signals as declared-timing channels | Accepted |
 | [0007](docs/adr/0007-memory-ordering-elimination.md) | Memory ordering elimination via compile-time scheduling proofs | Accepted |
 | [0008](docs/adr/0008-clock-aware-memory-management.md) | Clock-aware memory management | Accepted |
 | [0009](docs/adr/0009-implied-hardware-architecture.md) | The implied hardware architecture | Speculative |
+| [0010](docs/adr/0010-channel-based-io.md) | Channel-based I/O — hardware signals as declared-timing channels | Accepted |
 
 ---
 
@@ -270,7 +270,7 @@ If yes to (2): reclaim. Immediately, at the boundary, with no grace period, no b
 
 In each domain, the current answer is a runtime mechanism (scheduler, priority system, WCET tool) that solves at runtime what declared timing would prevent at compile time.
 
-**Power consumption** is the natural concern with a model built on dedicated cores and polling loops: a core that spins looks like a core that burns. The self-regulating backoff (ADR-0006) is the direct answer. Under low load the poll interval expands by a declared number of cycles — the core is genuinely idle between checks, not spinning. The idle period is not a heuristic sleep or a timer interrupt guess; it is a compiler-known cycle count derived from the ring depth at the last boundary. The core wakes exactly when it declared it would, does exactly the work that was budgeted, and returns to idle. This is closer to a clock-gated circuit than to a busy-wait loop: activity is proportional to actual work, transitions are instantaneous at the cycle boundary, and the power envelope is as predictable as the timing envelope — because they are the same thing.
+**Power consumption** is the natural concern with a model built on dedicated cores: a core running declared-timing circuits looks like a core that burns. The channel depth-driven budget adjustment (ADR-0010) is the direct answer. Under low load the circuit's declared cycle budget expands — the core is genuinely idle between executions, not spinning. The idle period is not a heuristic sleep or a timer interrupt guess; it is a compiler-known cycle count derived from the channel depth at the last boundary. The core executes again exactly when it declared it would, does exactly the work that was budgeted, and returns to idle. This is closer to a clock-gated circuit than to a busy-wait loop: activity is proportional to actual work, transitions are instantaneous at the cycle boundary, and the power envelope is as predictable as the timing envelope — because they are the same thing.
 
 The mobile modem is a concrete example of the leverage. A modem is a real-time pipeline — channel decoding, demodulation, protocol state machines — running on dedicated DSP or application processor cores alongside the general-purpose OS. Today, power management for the modem is a stack of heuristics: radio frequency duty cycling, DRX (discontinuous reception) timers tuned per operator, proprietary firmware that the OS cannot inspect. The result is a permanently negotiated truce between latency and battery life, re-tuned for every chipset and every carrier. Under a clock-aware model, the modem pipeline declares its cycle budget per frame interval (e.g. every 1 ms LTE subframe). Between frame boundaries the cores are idle for a compiler-proven duration — not an estimated one. The radio wakes at the declared cycle, processes the frame within the declared budget, and returns to a known-idle state. Power draw becomes a compile-time output of the frame schedule, not a runtime measurement that firmware attempts to minimise after the fact. The same model that removes the Linux scheduler from a trading system removes the DRX heuristic from a modem.
 
@@ -293,7 +293,7 @@ In every case: remove the unknowing, and the algorithm that compensates for it b
 
 ### What about cache management?
 
-The objection is natural: doesn't a polling loop or a deterministic access pattern still require explicit cache management — prefetch instructions, cache-line alignment, working set pinning?
+The objection is natural: doesn't a deterministic access pattern still require explicit cache management — prefetch instructions, cache-line alignment, working set pinning?
 
 The answer is that a fully deterministic access schedule solves cache management as a consequence, not as an additional concern. The hardware prefetcher works by detecting stride patterns in memory accesses. A clock-aware access schedule *is* a stride pattern — the same memory regions are accessed in the same order at the same cycle interval, every iteration, without exception. The prefetcher has the simplest possible job: a perfectly regular pattern it can detect after one or two iterations and predict indefinitely.
 
