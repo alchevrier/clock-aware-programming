@@ -225,13 +225,13 @@ This replaces `/proc`, `/sys`, `perf_event_open`, `eBPF`, and every observabilit
 Which OS circuits execute is a build-time declaration in `system.cap`. On a bare-metal HFT system:
 
 ```
-circuits.os = [TimerCircuit, NicCircuit, MemoryCircuit, ObservabilityCircuit]
+circuits.os = [ClockCircuit, NicCircuit, MemoryCircuit, ObservabilityCircuit]
 ```
 
 On a development machine:
 
 ```
-circuits.os = [TimerCircuit, NicCircuit, MemoryCircuit, FilesystemCircuit, DisplayCircuit, ObservabilityCircuit, DebugChannel]
+circuits.os = [ClockCircuit, NicCircuit, MemoryCircuit, FilesystemCircuit, DisplayCircuit, ObservabilityCircuit, DebugChannel]
 ```
 
 Circuits not listed in the configuration emit no code. There is no dead-code elimination pass at link time — the circuits are simply never compiled in. A bare-metal HFT build has no filesystem code in the binary, by construction, not by convention. A circuit that subscribes to a channel not backed by any declared hardware in `system.cap` is a compile error.
@@ -242,23 +242,198 @@ There is no process. There is no `fork`. There is no `exec`. There is no ELF loa
 
 Running a program means dynamically adding a compiled circuit to the live system. The circuit arrives as a signed, verified manifest — its timing declarations, its lifetime types, its channel subscriptions already compiler-verified against `system.cap`. The OS scheduler (which is the clock) examines the manifest, allocates cycle windows that do not overlap with existing circuits, pins the circuit's working set into the declared memory tier, and registers its channel subscriptions. From that moment, the circuit executes at its declared cycles alongside every other circuit in the system.
 
+Every time the runtime adds a circuit, it adds it alongside the circuit that handles its error signal. The circuit manifest declares both as a pair — the main circuit and its error-handler circuit — and the runtime registers them atomically. The main circuit never begins execution without its error-handler already subscribed to its error channel. This is not optional and cannot be deferred: a circuit whose error-signal handlers are not compiler-verified does not compile. Adding a circuit and adding its error-handler are not two operations. They are one.
+
+The runtime supplies a default error-handler for every signal type. The default handlers are conservative: log the signal to the observability channel, remove the circuit cleanly, notify any declared dependents via `Channel<DependencyLost>`. A programmer who does not declare a custom handler gets this behaviour automatically — and the compiler records in the manifest which signals are handled by the default and which have an explicit override. A programmer who declares a custom error-handler circuit replaces the default for the specific signal types it covers; the remainder fall through to the default. There is no way to leave a signal type unhandled: either the programmer's handler covers it, or the default does.
+
+```
+                          ┌─────────────────────────────┐
+                          │         RUNTIME              │
+                          │                              │
+                          │  add_circuit(manifest)       │
+                          │       │                      │
+                          │       ▼                      │
+                          │  ┌────────────┐              │
+              inputs ────►│  │   CIRCUIT  │──► outputs   │
+                          │  └─────┬──────┘              │
+                          │        │ Channel<ErrorSignal> │
+                          │        ▼                      │
+                          │  ┌─────────────────────────┐ │
+                          │  │     ERROR HANDLER        │ │
+                          │  │                          │ │
+                          │  │  custom  │   default     │ │
+                          │  │ ─────────┼────────────── │ │
+                          │  │ declared │ log + remove  │ │
+                          │  │ handler  │ + notify deps │ │
+                          │  └─────────────────────────┘ │
+                          │                              │
+                          │  ← registered atomically →   │
+                          └─────────────────────────────┘
+```
+
+Both halves of the pair appear in the same manifest. The compiler verifies that every signal type the circuit can emit is covered — either by a declared custom handler or by the runtime default. The runtime installs both or neither. There is no intermediate state in which the circuit runs without its error-handler present.
+
+The protocol for `add_circuit` is seven steps, each of which completes before the next clock edge:
+
+```
+Step 1 — WRITE TO STAGING REGION
+         Write the compiled circuit image into a reserved
+         staging region of the declared memory tier.
+
+         [ circuit image ] ──► [ staging region ]
+                                      │
+Step 2 — SET READY FLAG               │
+         Set ready_to_load = true in  │
+         the staging region header.   │
+                                      ▼
+Step 3 — WAIT FOR CLOCK EDGE    [ ready_to_load = true ]
+         The caller yields at its     │
+         declared cycle boundary.     │
+         The clock is already coming. │
+                                      ▼
+Step 4 — RUNTIME READS STAGING  [ clock edge ]
+         The runtime's loader         │
+         circuit fires on the         │
+         same clock edge. It          │
+         reads ready_to_load,         │
+         reads the image.             │
+                                      ▼
+Step 5 — WRAP WITH ERROR HANDLER [ image validated ]
+         Runtime binds the error-     │
+         handler (custom if declared, │
+         default otherwise) to the    │
+         circuit's error channel.     │
+                                      ▼
+Step 6 — WRITE TO DISPATCH TABLE [ pair bound ]
+         Runtime writes the           │
+         circuit's memory location    │
+         and cycle windows into       │
+         the dispatch table.          │
+                                      ▼
+Step 7 — SET LIVE FLAG           [ dispatch table updated ]
+         Runtime sets circuit_live    │
+         = true in the table entry.   │
+         The circuit executes at      │
+         its next declared window.    │
+         The loader circuit's flag    ◄─── runtime sees it
+         is already observed by the        automatically on
+         dispatch loop — no            the next table scan
+         explicit notification.
+```
+
+Nothing in this protocol requires a syscall, a lock, or a shared counter. The staging region is owned by the caller until `ready_to_load` is set; owned by the runtime from that point. The dispatch table is written once by the runtime and read continuously by the dispatch loop. The only shared state is the flag — and the flag is written once, in one direction, at a clock boundary.
+
+The consequence of this protocol is the deepest constraint in the model: **the runtime must run in sync with the system clock**. Every step in the protocol — the flag check, the image read, the error-handler binding, the dispatch table write, the live flag — is keyed to a clock edge. The loader circuit fires at a clock edge. The dispatch loop advances at a clock edge. The circuit's first window begins at a clock edge. If the runtime drifted from the system clock, the protocol would break: a flag set at cycle N might not be seen until cycle N+k, and the circuit's declared windows would no longer correspond to real hardware time.
+
+This is not an implementation detail to be managed. It is the core invariant the model is built on — the same invariant that makes the compiler's timing proofs valid. The runtime is not a program that happens to be aware of the clock. The runtime *is* the clock, from the software's perspective. Its own execution is the reference against which all declared windows are measured. A runtime that loses clock synchronisation does not produce degraded performance — it produces incorrect behaviour, because the timing declarations that the compiler proved correct are no longer being honoured by the hardware they were proved against.
+
+This collapses the conventional distinction between scheduler and clock. In a conventional OS, the scheduler is a software component that runs on top of the hardware clock — it reads a timer, decides who runs next, and context-switches. The clock and the scheduler are separate things; the scheduler is downstream of the clock. In the clock-aware model, **the scheduler is the CPU clock**. There is no software layer that reads the timer and decides. The dispatch table is compiled from timing declarations; the clock advances; the circuit whose window begins at this edge executes. The scheduler does not make a decision — the clock makes the decision, because the decision was already encoded into the dispatch table at compile time. The clock is the scheduler. They are the same thing.
+
 Stopping a program means removing the circuit. Its cycle windows are reclaimed. Its declared memory tier is released at the next cycle boundary — no GC, no deallocation, no reference counting. Its channel subscriptions are unregistered. The system continues without it.
 
 The mental model is a PCB where you can slot in and remove chips while the board is powered. The rest of the board does not pause. The clock does not stop. The other circuits do not know and do not need to know. The bus just has one fewer participant.
 
 This has a direct consequence for correctness: a program cannot affect another program's timing unless it is explicitly connected via a declared channel. There is no shared address space to corrupt. There is no scheduler to starve. There is no heap to fragment. Two circuits running on the same machine are as isolated as two chips on separate parts of a PCB — unless a wire between them is explicitly soldered into the design.
 
-### Booting Is Adding the OS Circuit
+### Booting Is Two Steps: Add the Runtime, Then Add the Kernel Circuits
 
-Boot is not a special phase. It is the first instance of the same operation: adding a circuit to the runtime.
+Boot is not a special phase. It is two sequential applications of the same primitive, performed once at power-on.
 
-The ~500 lines of Assembly stubs perform the minimal hardware initialisation that cannot yet be expressed in the language — memory controller setup, clock configuration, cache enablement, the first stack pointer. Once that completes, control transfers to the OS circuit: a compiled, verified manifest of declared-timing circuits covering the timer, the memory manager, the NIC, the observability sub-circuits, and whatever else `system.cap` declares.
+**Step 1 — Add the runtime.** The ~500 lines of Assembly stubs perform the minimal hardware initialisation that cannot yet be expressed in the language — memory controller setup, clock configuration, cache enablement, the first stack pointer. Once that completes, the runtime itself starts: the dispatch loop, the loader circuit, the memory tier manager, the clock synchronisation mechanism. The runtime is not a circuit — it is the substrate that circuits run on. After step 1, the system is alive but empty: a running runtime with no circuits in its dispatch table.
 
-The runtime starts. The OS circuit is registered. Its cycle windows are allocated. Its channel subscriptions go live. From that point, the system is in normal operation — the OS is just another set of circuits running at declared cycles. There is no "kernel mode" to exit, no "userspace" to enter, no privilege boundary to cross. The Assembly stubs ran once at power-on and will never run again.
+**Step 2 — Add the kernel circuits.** The runtime immediately calls `add_circuit` with the kernel manifest — a compiled, verified set of declared-timing circuits covering the timer, the memory manager, the NIC, the namespace, the observability sub-circuits, the terminal, and whatever else `system.cap` declares. Each kernel circuit goes through the standard seven-step `add_circuit` protocol: staged, flagged, read, wrapped with its error-handler, written to the dispatch table, marked live. After step 2, the kernel circuits are running at their declared cycles. The system is in normal operation.
 
-Any subsequent program launch — a trading engine, a monitoring daemon, a debug session — is the same operation at runtime: a verified circuit manifest arrives, cycle windows are allocated, subscriptions go live. Boot and launch are the same primitive. Boot just happens to be the first one, with the OS manifest, on a machine that had nothing running yet.
+```
+  POWER ON
+     │
+     ▼
+  [ Assembly stubs — hardware init ]
+     │
+     ▼
+  STEP 1: ADD RUNTIME
+  ┌─────────────────────────────────┐
+  │  dispatch loop                  │
+  │  loader circuit                 │
+  │  memory tier manager            │
+  │  clock sync                     │
+  │                                 │
+  │  dispatch table: (empty)        │
+  └──────────────┬──────────────────┘
+                 │ add_circuit(kernel manifest)
+                 ▼
+  STEP 2: ADD KERNEL CIRCUITS
+  ┌─────────────────────────────────┐
+  │  dispatch table:                │
+  │    ClockCircuit      [live]     │
+  │    MemoryCircuit     [live]     │
+  │    NicCircuit        [live]     │
+  │    NamespaceCircuit  [live]     │
+  │    ObservabilityCircuit [live]  │
+  │    TerminalCircuit   [live] ◄── user types here
+  └─────────────────────────────────┘
+```
 
-### Drivers Are Circuits
+There is no "kernel mode" to exit, no "userspace" to enter, no privilege boundary to cross. The Assembly stubs ran once and will never run again. The runtime is running. The kernel circuits are circuits. Any subsequent program launch is the same `add_circuit` call — step 2, repeated. Boot just happens to be the first time step 2 runs, with the kernel manifest, on a dispatch table that was empty.
+
+Each kernel circuit has a single, narrow responsibility:
+
+| Circuit | Responsibility | Exposes |
+|---|---|---|
+| `ClockCircuit` | Reads the hardware cycle counter (TSC). Calibrates it to wall-clock time. Does not drive the scheduler — the CPU clock does that directly. | `Channel<Tick>`, `Channel<WallClock>` |
+| `MemoryCircuit` | Pre-allocates memory regions at slot time. Manages tier promotion/demotion. Handles circuit removal and reclaim. | `Channel<SlotAck>`, `Channel<RemovalSignal>` |
+| `NicCircuit` | DMA-paced network I/O via the NIC driver. Delivers frames to subscriber circuits at declared cycles. | `Channel<EthernetFrame>` |
+| `NamespaceCircuit` | Maps names and identifiers to `Cold` tier regions. The filesystem namespace. | `Channel<ColdRegion>` |
+| `ObservabilityCircuit` | Publishes per-circuit utilisation, timing deltas, and system snapshots at a declared low-frequency window. | `Channel<SystemSnapshot>` |
+| `TerminalCircuit` | Reads keyboard input. Resolves names in the namespace. Calls `add_circuit`. Displays output. | `Channel<DisplayOutput>` |
+
+`ClockCircuit` is worth dwelling on. In a conventional OS, the timer interrupt is what drives the scheduler: it fires periodically, the kernel preempts the running process, picks the next one. In the clock-aware model, the scheduler *is* the CPU clock — the dispatch table encodes who runs at which tick, and the clock advances it. `ClockCircuit` has nothing to do with scheduling. It is purely a source of time-as-a-value: circuits that need elapsed time, timeouts, or wall-clock timestamps subscribe to its channels. The scheduling mechanism and the timekeeping mechanism are completely separate, which is the correct factoring.
+
+### Callable and Non-Callable Circuits
+
+Not all circuits are equal from the user's perspective. The OS circuit collection includes a `TerminalCircuit` — a circuit that subscribes to `Channel<KeyboardInput>`, parses commands, and dispatches to other circuits by name. It is the user-facing surface of the system. What it can dispatch to defines the distinction between circuit kinds:
+
+**Callable circuits** are registered in the `NamespaceCircuit` with a public name. The terminal can look them up by name and invoke them via `add_circuit`. They produce output to a `Channel<DisplayOutput>` that the terminal subscribes to for the duration of their execution. They are the clock-aware equivalent of POSIX commands — `ls`, `cp`, `grep`, and any user-defined program that declares itself callable. A callable circuit is a first-class citizen of the namespace: it has a name, a manifest, a declared signature, and can be composed with other callable circuits via channel piping.
+
+**Non-callable circuits** have no public name entry in the `NamespaceCircuit`. They cannot be invoked from the terminal. Two sub-kinds:
+
+| Sub-kind | Examples | Added by |
+|---|---|---|
+| System circuits | `ClockCircuit`, `MemoryCircuit`, `NicCircuit`, `NamespaceCircuit`, `ObservabilityCircuit` | Boot manifest |
+| Application circuits | Trading engine, risk checker, background daemon | Programmatically via `add_circuit` from another circuit |
+
+System circuits are the kernel. Application circuits are long-running programs added by other circuits or by the terminal's own `add_circuit` call when the user requests a background process. Neither is reachable by name from the terminal prompt — they are not callable, they are running.
+
+```
+  BOOT (step 2 complete)
+   │
+   ▼
+  ┌──────────────────────────────────────────────┐
+  │  KERNEL CIRCUITS (system circuits, non-callable) │
+  │                                              │
+  │  ClockCircuit   MemoryCircuit   NicCircuit   │
+  │  NamespaceCircuit   ObservabilityCircuit     │
+  │  TerminalCircuit ◄── user types here         │
+  └──────────────┬───────────────────────────────┘
+                 │ looks up name in NamespaceCircuit
+                 │ calls add_circuit(manifest)
+                 ▼
+        ┌─────────────────────┐
+        │  CALLABLE CIRCUITS  │  (POSIX equivalents + user programs)
+        │                     │
+        │  ls   cp   grep     │
+        │  MyProgram  ...     │
+        └─────────────────────┘
+                 │ add_circuit (background / long-running)
+                 ▼
+        ┌─────────────────────┐
+        │ APPLICATION CIRCUITS│  (non-callable, always running)
+        │                     │
+        │  TradingEngine      │
+        │  RiskChecker  ...   │
+        └─────────────────────┘
+```
+
+The terminal is itself a system circuit — it is not callable from itself. It is added at boot alongside the other OS circuits and runs in its own declared cycle windows, subscribing to keyboard input and display output via their respective driver circuits. There is no shell interpreter in the traditional sense: the terminal does not evaluate a scripting language. It resolves a name in the namespace, verifies the manifest against `system.cap`, and calls `add_circuit`. The "shell" is name lookup plus circuit registration. That is all it is.
 
 A driver is a circuit with a declared channel interface. Two structural kinds:
 
@@ -322,7 +497,7 @@ The compiler feeds the compiled circuit body to `llvm-mca` (or its equivalent in
 The compiler collects every circuit in the system — OS circuits and application circuits — and solves for a static, non-overlapping assignment of tick windows to cores:
 
 ```
-core 0, tick   0: TimerCircuit      (window: 6 ticks)
+core 0, tick   0: ClockCircuit      (window: 6 ticks)
 core 0, tick   6: MemoryCircuit     (window: 8 ticks)
 core 2, tick   0: parsePrice        (window: 12 ticks)
 core 2, tick  12: updateBook        (window: 10 ticks)
@@ -331,7 +506,7 @@ core 3, tick   0: ObservabilityCircuit (window: 300M ticks)
 
 This is a constraint satisfaction problem: assign windows such that (a) no two circuits share a core at the same tick, (b) every window ≥ its `llvm-mca` worst-case count, (c) every handoff pair satisfies writer_window_end < reader_window_start. If the constraint system is unsatisfiable — the declared circuits do not fit on the declared cores within their declared budgets — it is a compile error, naming the conflicting circuits and the shortfall in ticks. The system does not ship with a timing conflict hidden inside it.
 
-Critically, the OS circuits are in this table. Because the OS is written in the same language, compiled by the same compiler, the compiler knows the timing of `TimerCircuit`, `MemoryCircuit`, `NicCircuit`, and every other OS circuit with the same precision it knows `parsePrice` or `updateBook`. There is no hidden layer. There is no "kernel time" subtracted from user budget as a runtime guess. The OS circuits occupy declared tick windows; the compiler reserves those windows first; application circuits fill the remaining capacity. The constraint solver sees the complete picture: every tick on every core, OS and application together, as one unified scheduling problem.
+Critically, the OS circuits are in this table. Because the OS is written in the same language, compiled by the same compiler, the compiler knows the timing of `ClockCircuit`, `MemoryCircuit`, `NicCircuit`, and every other OS circuit with the same precision it knows `parsePrice` or `updateBook`. There is no hidden layer. There is no "kernel time" subtracted from user budget as a runtime guess. The OS circuits occupy declared tick windows; the compiler reserves those windows first; application circuits fill the remaining capacity. The constraint solver sees the complete picture: every tick on every core, OS and application together, as one unified scheduling problem.
 
 This is qualitatively different from every existing OS scheduler. Linux's `SCHED_DEADLINE` takes a declared execution time and deadline and attempts to honour them at runtime — but it cannot prove the OS itself will not violate them, because the kernel's own execution time is not declared. The clock-aware compiler proves the OS and the application fit together before either executes.
 
@@ -447,12 +622,55 @@ The runtime selects which circuit to remove by priority, declared in `system.cap
 
 ```
 circuits.eviction.policy = LowestPriority
-circuits.eviction.exempt = [TimerCircuit, MemoryCircuit, ObservabilityCircuit]
+circuits.eviction.exempt = [ClockCircuit, MemoryCircuit, ObservabilityCircuit]
 ```
 
 Exempt circuits cannot be evicted. Priority among non-exempt circuits is declared — not heuristically scored at runtime. The eviction decision is deterministic and reproducible: given the same manifest and the same memory pressure event, the same circuit is always removed. There is no OOM killer randomness. There is no "it killed the wrong process" post-mortem.
 
 The reclaimed bytes are immediately available for the new circuit's pre-allocation. The slot request that triggered the eviction is retried once the ack is received. If the reclaimed amount is still insufficient — because the evicted circuit was smaller than needed — the process repeats with the next lowest-priority circuit. Each eviction is a separate log entry. The sequence of removals that preceded a successful slot is fully traceable from the observability channel.
+
+### The Filesystem Is the Cold Tier
+
+A traditional filesystem bundles three distinct concerns: block I/O, caching, and a namespace. In the clock-aware model, two of those three are already solved by the tier system and the driver model.
+
+**Block I/O** is the NVMe driver circuit: DMA-paced, DREQ-driven, timing declared, no polling, no blocking. It is already present in the OS circuit collection.
+
+**Caching** is the tier system itself. Data that starts in the `Cold` tier (NVMe, demand-loaded) and is promoted to `Permanent` or `Session` (DRAM, pinned) *is* the cache — with the promotion policy declared at compile time rather than managed by a page replacement algorithm at runtime. There is no separate buffer cache to maintain. There is no `drop_caches`. The tier system is the cache, and the runtime is its manager.
+
+**The namespace** — the mapping from names to locations in the `Cold` tier — is the one part that requires a dedicated circuit. This is the `NamespaceCircuit`:
+
+```
+  name / identifier
+         │
+         ▼
+  ┌─────────────────────┐
+  │   NamespaceCircuit  │
+  │                     │
+  │  name ──► Cold<T>   │   reads/writes via NVMe driver circuit
+  │           region    │──────────────────────────────────────►
+  │           + offset  │
+  │           + size    │
+  └─────────────────────┘
+         │
+         ▼
+  Channel<ColdRegion>   (returned to caller at declared cycle)
+```
+
+The `NamespaceCircuit` maps identifiers — circuit names, handoff keys, manifest hashes, application-level paths — to declared `Cold` regions. It holds no cache of its own; the tier system already promotes hot regions into DRAM. It performs no journaling in the traditional sense; durability is the declared write-commit policy of the `Cold` tier, enforced at the clock boundary by the NVMe driver circuit. It holds no locks; lookups are channel reads, writes are channel writes, and conflicting writes to the same region are resolved at the clock boundary by the runtime's ownership model.
+
+| Traditional filesystem concern | Clock-aware equivalent | Where it lives |
+|---|---|---|
+| Block I/O | NVMe driver circuit | OS circuit collection |
+| Page cache / buffer cache | `Permanent` / `Session` tier promotion | Runtime tier manager |
+| Cache eviction policy | Tier demotion on memory pressure | Runtime (declared weights) |
+| Journal / durability | `Cold` write-commit at clock boundary | NVMe driver circuit |
+| Namespace (paths, inodes) | `NamespaceCircuit` | OS circuit collection |
+| File locking | Channel ownership at clock boundary | Runtime ownership model |
+| `open` / `close` / `mmap` | `Cold<T>` channel subscription | Language type system |
+
+There is no `VFS` layer. There is no `inode` table separate from the namespace. There is no `dentry` cache separate from the `Permanent` tier. There is no `fsync` — the write-commit cycle boundary *is* the sync. A programme that holds a `Cold<T>` handle is subscribed to that region; when it drops the handle (removes the subscription), the runtime releases the region back to the `NamespaceCircuit`. There is no file descriptor table. There is no `open file description`. There is a typed channel subscription — the same primitive used for every other resource in the system.
+
+The filesystem was always a cache manager bolted on top of block I/O with a namespace on top. When the cache manager is the runtime, the block I/O is the driver circuit, and the namespace is one more OS circuit, the filesystem disappears as a concept — and what remains is simpler, faster, and fully verified by the same compiler that verifies everything else.
 
 ---
 
