@@ -95,6 +95,40 @@ Passing `out` as a parameter — the imperative style — is not expressible. A 
 
 The programmer writes the logic. The annotations declare the contract. The compiler proves the contract is consistent with the hardware model in `system.cap`. There is no runtime that the programmer reasons about separately from the language — the runtime enforces the same contract the compiler proved.
 
+### The Compiler Is ALU-Aware
+
+Proving that a declared budget is honourable requires the compiler to know the ALU cost of every operation it compiles. A declaration of `@Timeslice(cycle = "4ns")` is meaningless unless the compiler can count the cycles the function's instruction sequence actually consumes on the target microarchitecture.
+
+The compiler maintains a per-target **ALU cost table**: the cycle count for each instruction or micro-operation on the target execution units, derived from the microarchitecture model in `system.cap`. When it compiles a function, it walks the instruction sequence and accumulates a cycle budget:
+
+```
+fn parsePrice — @Timeslice(cycle = 4ns)
+
+  instruction             execution unit   cycles
+  ──────────────────────  ───────────────  ──────
+  channel.get()           load port        1
+  status field extract    ALU              1
+  branch (predicted)      branch unit      0
+  extract(msg)            ALU × 3          3
+  Channel.of()            store port       1
+                                          ──────
+  hot path total                           6 cycles  →  1.5 ns @ 4 GHz
+
+  declared budget:  4 ns  (16 cycles @ 4 GHz)
+  hot path cost:    6 cycles
+  margin:           10 cycles  ✓  budget honoured
+```
+
+If the accumulated cost of the hot path exceeds the declared budget, the compiler rejects the programme with a precise error: which operations consumed which cycles, and by how much the budget was exceeded. This is not a warning. It is the same class of error as a type mismatch.
+
+The ALU cost table is not a heuristic. It is derived from the microarchitecture descriptor in `system.cap` — the same source the runtime uses to verify timing at slot time. The programmer declares `system.cap = skylake-4ghz`; the compiler loads the Skylake execution port latencies; the budget check uses those exact numbers. On a different target, the same source code with the same annotation may require a larger budget — the compiler will say so.
+
+This is what makes `@Timeslice` a proof obligation rather than a hint. The compiler is not estimating whether the function will probably fit. It is calculating whether it provably fits, from first principles, against the declared hardware model. If it does, the timing annotation is a theorem. If it does not, it is a compile error.
+
+The target in `system.cap` can be chosen for compliance purposes as well as for hardware accuracy. A system targeting automotive safety certification declares `compliance = ISO-26262-ASIL-D`; a medical device declares `compliance = IEC-62304-Class-C`; an avionics system declares `compliance = DO-178C-Level-A`. The compiler loads the corresponding constraint profile — tighter budget margins, mandatory worst-case execution time (WCET) bounds, required proof artefact format — and validates against those requirements in addition to the hardware model. The timing proof the compiler produces is not just internally consistent; it is in the format the certification body requires.
+
+This makes the compiler the certification tool. There is no separate static analyser, no WCET tool bolted on after the fact, no manual timing analysis in a spreadsheet. The same compilation step that proves hardware correctness produces the compliance artefact. A programme that compiles against `compliance = DO-178C-Level-A` is, by construction, a programme whose timing behaviour is provable to the required standard.
+
 ### Immutable Arguments
 
 All function arguments are immutable by default. Data flow is explicit: a value flows into a function through a declared input channel, is transformed, and flows out through a declared output channel. There is no shared mutable state because there is no mechanism to express it. Side effects are channel writes — declared, typed, subscription-checked.
@@ -238,6 +272,32 @@ Every inter-function data path in the system, whether called a channel, a ring b
 
 The compiler sees one construct. The hardware sees one thing: a stride into a contiguous array.
 
+**Every standard library function declares its own cycle budget.** This is mandatory — a stdlib function without a declared `@Timeslice` does not compile into the standard library. The declaration is per-target: `put` on `FlatMap<K,V>` against a Skylake target at 4 GHz costs a different number of cycles than the same call against a Cortex-A72. The stdlib ships a budget table per supported target, derived from the same ALU cost model the compiler uses.
+
+When the programmer calls a stdlib function inside a timed `fn`, the compiler substitutes the stdlib function's declared budget for the target into the caller's accumulated cycle count. The programmer does not need to look up the cost manually — the compiler propagates it:
+
+```
+fn parsePrice — @Timeslice(cycle = 4ns) — target: skylake-4ghz
+
+  operation                       source    cycles
+  ──────────────────────────────  ────────  ──────
+  channel.get()                   stdlib     1
+  status field extract            ALU        1
+  FlatMap.get(symbol)             stdlib     3     ← binary search, 1024 elements
+  extract(msg)                    ALU        3
+  Channel.of()                    stdlib     1
+                                            ──────
+  hot path total                             9 cycles  →  2.25 ns @ 4 GHz
+
+  declared budget: 4 ns (16 cycles)
+  hot path cost:   9 cycles
+  margin:          7 cycles  ✓
+```
+
+The stdlib budget entries are labelled `stdlib` in the compiler's output — distinct from user ALU operations — so the programmer can see exactly which stdlib calls dominate their budget and replace them with cheaper alternatives if needed.
+
+This has a second consequence: the standard library cannot contain a function whose worst-case cost is unbounded. A function whose cycle count depends on runtime input size — a sort, a full linear scan, an unbounded iteration — cannot be declared with a fixed budget and therefore cannot be in the stdlib. The stdlib is, by construction, a collection of functions with statically-bounded costs. Unbounded operations must be expressed as circuits with declared windows and explicit `@Cold` deferred paths, not as stdlib calls on the hot path.
+
 ### A Class Is a Circuit with an ALU
 
 In conventional languages a class is a bundle of data and methods — an organisational unit with no hardware meaning. In the clock-aware language a class is a circuit: it has declared state (registers), declared operations (the ALU — the combinational logic that transforms inputs to outputs), and a declared timing contract.
@@ -335,9 +395,13 @@ If it compiles, the hardware-correctness is not assumed. It is a theorem.
 
 ---
 
-## AI-Friendly by Construction
+## Designed for AI Authorship
 
-Current AI code generation tools fail at systems and embedded code for a structural reason: the correctness constraints are not in the source file. Interrupt priorities, stack sizes, RTOS task budgets, hardware timing relationships, memory ordering semantics — these live in datasheets, reference manuals, and tribal knowledge the AI cannot access. The AI generates plausible code. Plausible is not correct. In systems code, incorrect means dangerous.
+Every other systems language was designed for humans to write by hand. The clock-aware language is designed with the assumption that AI writes the code — and the compiler verifies it. This is not an afterthought or a compatibility claim. It is a design principle that shaped every decision in the model.
+
+The reason current AI code generation fails at systems and embedded code is structural: the correctness constraints are not in the source file. Interrupt priorities, stack sizes, RTOS task budgets, hardware timing relationships, memory ordering semantics — these live in datasheets, reference manuals, and tribal knowledge the AI cannot access. The AI generates plausible code. Plausible is not correct. In systems code, incorrect means dangerous.
+
+The clock-aware model eliminates this problem by design: every constraint that matters is either in the type system, in the `@Timeslice` annotation, or in `system.cap`. There is nothing left outside the source file. The AI generates code; the compiler checks every constraint the AI touched and every constraint it didn't think about. The AI does not need to be correct. It needs to compile.
 
 Why the clock-aware language is different:
 
@@ -349,6 +413,8 @@ Why the clock-aware language is different:
 | `Channel<T>` | AI knows the complete I/O pattern from the subscription list |
 | Exhaustive match | AI cannot silently omit a state; every unhandled case must be explicitly declared as ignored or defaulted — the compiler rejects undeclared intent |
 | Hardware-correct by type | AI's output is compiler-validated, not human-validated |
+
+The context window requirement for correct systems code collapses to almost nothing. In a conventional model, the AI needs the hardware reference manual, the RTOS documentation, the platform BSP, the team's internal timing budget spreadsheet, the certification standard, and years of tribal knowledge about what the scheduler actually does under load — hundreds of books of context that no finite window can hold, and that changes between projects. In the clock-aware model, all of that context is in the compiler. The hardware model is `system.cap`. The timing constraints are the ALU cost table. The compliance requirements are the declared profile. The memory model is the tier system. The AI needs to know four rules and the type signatures of the functions it is calling. The compiler holds everything else. A context window of four rules is enough to write correct kernel code.
 
 The feedback loop changes from:
 
@@ -365,6 +431,29 @@ generate → compile → read precise local error → fix → compile again
 No hardware required. No flashing. No guessing. The AI does not need to know the 9,000 pages of hardware documentation. The compiler enforces them. The AI follows the types.
 
 This is the first systems model that is genuinely legible to an AI code generator — not because the AI became smarter, but because the model stopped hiding information from it. The information was always there; it was just never declared.
+
+### The Compiler as the Sole Gatekeeper — No Human Required
+
+The completeness of the compile-time proof has a direct consequence for how code can be produced and reviewed: **an AI can generate and another AI can review, with the compiler as the sole arbiter of correctness. No human needs to be in the loop.**
+
+This is not a claim about AI capability. It is a claim about what the compiler guarantees. Every correctness property that matters in this model is checked at compile time:
+
+| Property | Checked by |
+|---|---|
+| Timing budget honoured | Compiler (ALU cost table vs declared `@Timeslice`) |
+| Memory footprint bounded | Compiler (lifetime types, declared tier, declared size) |
+| Error signals handled | Compiler (exhaustive match, error-handler pair at registration) |
+| Channel types match | Compiler (subscription types checked at the connection site) |
+| No unbounded operations on hot path | Compiler (stdlib functions must have declared budgets) |
+| No unsafe memory operations | Compiler (no `unsafe`, no pointer arithmetic, no `new`) |
+| No hidden shared state | Compiler (no mechanism to express it) |
+| Compliance target met | Compiler (constraint profile from `system.cap`) |
+
+None of these properties require a human to read the code and reason about it. They are either proven or the compilation fails. An AI reviewer's job is therefore not to check correctness — the compiler already did — but to check legibility, naming, and whether the declared structure matches the intended design. That job is well within the scope of current models.
+
+The consequence for kernel development is precise: **no garbage can enter the kernel**. A kernel circuit that compiles is one that the compiler has proven timing-correct, memory-correct, error-handled, and compliance-verified. A kernel circuit that does not compile does not ship. The gatekeeper is not a code reviewer, a security team, or a certification engineer. It is the compiler, running deterministically, producing the same verdict on every machine, every time.
+
+This is the model where AI-generated code becomes safe-to-ship in safety-critical systems — not because we trust the AI, but because we have a compiler that makes trust unnecessary.
 
 ---
 
