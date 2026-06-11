@@ -129,6 +129,24 @@ The target in `system.cap` can be chosen for compliance purposes as well as for 
 
 This makes the compiler the certification tool. There is no separate static analyser, no WCET tool bolted on after the fact, no manual timing analysis in a spreadsheet. The same compilation step that proves hardware correctness produces the compliance artefact. A programme that compiles against `compliance = DO-178C-Level-A` is, by construction, a programme whose timing behaviour is provable to the required standard.
 
+### The Compiler Does the Hardware's Job
+
+When the compiler knows ALU costs, timing constraints, register availability, and execution port utilisation — all declared in `system.cap` — it can perform every optimisation that hardware does speculatively at runtime, but do it statically, deterministically, and provably at compile time. The hardware then just runs.
+
+**Instruction reordering.** The compiler analyses data dependencies across the entire function body and reorders instructions to fill execution unit latency gaps. No out-of-order engine needed at runtime — the order is already optimal in the binary.
+
+**Wave pipelining.** The compiler schedules instruction waves across pipeline stages such that a new wave starts before the previous wave commits. This is what the hardware's pipeline does implicitly; the compiler makes it explicit and provable, independent of the hardware's speculation machinery.
+
+**Register collapsing.** With 30 architectural registers available in the target model and full visibility of the function's value lifetimes, the compiler assigns registers greedily — values that expire before a new value is needed reuse the same register. No spill to the stack. No reload. The register file is fully allocated at compile time with zero waste.
+
+**Branch elimination.** Branches are truth tables, not jumps. The compiler analyses every branch in the hot path and emits conditional move sequences — or pipelined table lookups across cores where the branch condition is the selector — replacing the branch with arithmetic. There is no branch predictor to warm up. There is no misprediction to recover from. The condition evaluates and the correct value is selected in a declared number of cycles.
+
+**Speculative execution — safe because deterministic.** The compiler can speculatively evaluate both sides of a branch, because it knows statically which paths are reachable and what their costs are. This is safe — no UB, no speculation barrier, no Spectre — because the compiler's speculation is not hardware speculation. It is a compile-time decision that has already been proven correct. The hardware executes the precomputed result.
+
+**Profile-guided optimisation (PGO).** When execution traces are available (from the trace unit — see Paper III), the compiler ingests them as input to the instruction ordering and register allocation passes. The optimised binary is derived from real execution data, not profiling heuristics. The trace is a proof input, not a suggestion.
+
+The consequence is that the CPU the clock-aware model implies has no need for an out-of-order engine, a branch predictor, a speculative execution buffer, a register rename table, or a return address stack. Those mechanisms exist to recover at runtime from decisions the compiler was never asked to make. Ask the compiler to make them, and the recovery machinery is unnecessary. What remains is a deep execution pipeline, large register file, wide issue ports — all of them doing computation, none of them doing speculation. Every transistor computes.
+
 ### Immutable Arguments
 
 All function arguments are immutable by default. Data flow is explicit: a value flows into a function through a declared input channel, is transformed, and flows out through a declared output channel. There is no shared mutable state because there is no mechanism to express it. Side effects are channel writes — declared, typed, subscription-checked.

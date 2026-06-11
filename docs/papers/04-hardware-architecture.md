@@ -210,6 +210,60 @@ The result is a system where every byte of memory is in exactly the right tier, 
 
 ---
 
+## The GPU as a Mathematical Circuit Array
+
+A conventional GPU exposes a homogeneous grid of CUDA cores — each core capable of any floating-point operation. The homogeneity is a design choice driven by the inability to predict, at hardware design time, which mathematical operations the programmer will need. The result is a general-purpose compute array that is efficient at parallel floating-point but structurally identical for every operation type.
+
+The clock-aware model inverts this. Because the compiler knows at compile time which mathematical operations a GPU circuit will execute — and at what volume, frequency, and precision — the hardware can be specialised per operation class rather than homogenised:
+
+| Operation class | Hardware unit | Optimised for |
+|---|---|---|
+| Linear algebra (matmul, dot) | Dense multiply-accumulate array | Throughput — maximum FLOPs per mm² |
+| Exponential / logarithmic | Approximation pipeline (Taylor, range reduction) | Latency — fixed cycles regardless of input |
+| Geometric (sin, cos, atan2) | Cordic pipeline | Accuracy — bit-exact at declared precision |
+| Softmax / normalisation | Reduction tree + reciprocal unit | Parallelism — vector-width normalisation in one pass |
+| Integer / bitwise | ALU array | Zero overhead for quantised inference |
+
+The compiler, knowing the operation mix of each GPU circuit from its declared channels and source code, emits a resource allocation that routes each operation to the correct unit. The GPU die is partitioned by operation class, sized by the declared workload, not by worst-case generalisation. A transformer inference circuit that is 90% matmul and 10% softmax gets a die allocation of 90% dense multiply-accumulate and 10% reduction tree — not 100% CUDA cores doing both inefficiently.
+
+The consequence is that inference throughput per mm² increases not because the transistors are faster but because every transistor is doing the right operation for its circuit. CUDA cores are a generalisation tax. Remove the tax, and the die area directly becomes computation.
+
+### Channel Is Broadcast — One Signal to All Subscribed Devices
+
+A `Channel<T>` write in the clock-aware model is not a point-to-point message. It is a **broadcast**: a single write to the channel simultaneously delivers the value to every circuit subscribed to that channel — including circuits on other cores, circuits backed by different memory tiers, and circuits that are hardware peripherals rather than software circuits.
+
+This means a `Channel<SensorReading>` produced by a sensor driver is received in the same tick by every circuit that declared a subscription to it — a display circuit, a logging circuit, an ML inference circuit, a control loop circuit — without the producer knowing or caring how many consumers exist. The compiler resolves the subscriber list from `system.cap` at build time and emits the correct fanout pattern for the physical topology (shared cache line, inter-core message, DMA ring).
+
+From the programmer's perspective, a channel write is one operation. From the hardware's perspective, it is a single cache line write that the cache coherency mesh fans out to all declared subscribers simultaneously. The broadcast is structural — not a runtime pub/sub dispatch, not an event bus, not a message broker. One write. All subscribers. Declared at compile time. Zero runtime overhead.
+
+### Precise and Imprecise Resources
+
+Not all hardware resources behave deterministically. The clock-aware model distinguishes two classes:
+
+**Precise resources** — resources whose timing is fully deterministic and compiler-provable. Every execution unit in the CPU, every DMA controller, every SRAM bank is a precise resource. The compiler assigns precise resources in the dispatch table with cycle-accurate bounds. A precise resource that deviates from its declared timing is a hardware fault, detected by the trace unit.
+
+**Imprecise resources** — resources whose timing has a distribution rather than a fixed value. A DRAM row activation, a NVMe read with queue depth contention, a network round-trip — these have declared *bounds* but not declared *exact cycles*. The compiler treats imprecise resources as `Cold` accesses: the declared bound is verified as achievable in the worst case, the actual cycle is whatever the hardware delivers, and the circuit's declared window covers the bound. The gap between actual and bound is absorbed as slack.
+
+The distinction matters for correctness. A `Permanent` tier access (DRAM, pinned) is precise — the compiler knows the exact row-to-column latency. A `Cold` tier access (NVMe) is imprecise — the compiler knows the declared worst-case, but not the actual. A circuit that treats an imprecise resource as precise — declaring a cycle budget too tight for the worst case — is a compile error. The compiler, reading the resource classification from `system.cap`, rejects declarations that conflate the two.
+
+### Device Learning and Calibration
+
+The clock-aware model can prove when a hardware device is not meeting its declared specification. Every device in `system.cap` declares its timing characteristics — the CPU's execution unit latencies, the DRAM's row activation time, the NVMe's read latency distribution. The trace unit continuously measures actual device behaviour against these declarations.
+
+When the measured latency of a precise resource deviates from its declared value, the `ObservabilityCircuit` emits a `Channel<DeviceViolation>` signal: the device, the declared latency, the measured latency, and the tick at which the deviation occurred. This is not a performance alert. It is a correctness proof failure — the hardware is not behaving as the compiler assumed.
+
+The uses of this are precise:
+
+1. **Manufacturing defects.** A CPU core that consistently delivers 10% more latency than its speed grade declares is a binning error. The trace proves it. The runtime can migrate circuits away from that core automatically, via `Channel<CoreEviction>`, and flag the device for replacement.
+
+2. **Thermal degradation.** A device that meets spec at cold but drifts under sustained load has its drift characterised by the atom stream over time. The compiler can be re-fed the measured latencies as a new `system.cap` entry — the calibrated model — and recompile against the device's actual behaviour rather than its nominal spec.
+
+3. **Workload validation.** A system delivered to a customer under a timing SLA can prove, from the continuous trace, that every declared SLA was honoured in every production tick. Not a benchmark. Not a load test. A continuous, hardware-sourced, cryptographically-signable proof of execution.
+
+The device is not just a declared resource. It is a continuously measured, self-calibrating input to the compiler model. The compiler's assumptions are always verifiable against reality, and the system adapts when reality diverges.
+
+---
+
 ## Relation to ADR-0009
 
 ADR-0009 (The Implied Hardware Architecture) in this repository records the same observation in decision form: that the clock-aware software model implies a hardware architecture, and that the compounding value of the primitive lives in the hardware convergence rather than in the software optimisation alone. This paper expands that observation into a full analysis.

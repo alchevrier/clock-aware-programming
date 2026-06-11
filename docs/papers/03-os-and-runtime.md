@@ -563,6 +563,36 @@ This is what Vivado does with FPGA timing constraints: it solves for register-to
 
 The CPU's own hardware pipeline — out-of-order execution, store forwarding, prefetcher — runs inside each window, invisible to the compiler. The compiler's pipeline runs across windows. Two levels of pipelining, both proven, both counted.
 
+### The Trace Unit — Proving the Compiler Was Right
+
+On ARM (and equivalent architectures), the trace unit timestamps every instruction as it commits. The clock-aware runtime subscribes to the trace unit's output as a `Channel<TraceEvent>` through the `ObservabilityCircuit`. This gives the system something no conventional OS has ever had: a continuous, hardware-sourced, instruction-level audit of every circuit's actual execution.
+
+What the trace unit provides:
+
+| Observable | What it proves |
+|---|---|
+| Instruction commit timestamp | Actual cycle at which each instruction executed |
+| Register values at commit | Register file state at any point in time |
+| Branch taken / not taken | Confirms compiler's branch elimination was correct |
+| Cache miss events | Proves zero cache misses on the hot path (or flags a violation) |
+| Port utilisation per window | Confirms actual execution unit usage matches compiler model |
+| Speculation events | Confirms no speculative execution occurred outside declared bounds |
+| Pipeline stall events | Confirms no circuit exceeded its declared budget |
+
+The compiler emits an **execution plan** alongside the binary — the expected sequence of instruction timestamps, register values, and port utilisations for the hot path. The `ObservabilityCircuit` continuously compares the trace stream against the execution plan. A deviation is a `Channel<ExecutionPlanViolation>` signal: the specific instruction, the expected cycle, the actual cycle, and the delta.
+
+This produces three guarantees that no conventional system can make:
+
+1. **Zero cache misses, proven in real time.** Every cache miss on the hot path is a trace event. If the execution plan predicts zero misses and the trace shows one, a violation signal fires immediately — not in a post-mortem profiler, not in a benchmark report, in the same execution window.
+
+2. **Misprediction confirmation.** There are no branches on the hot path by construction. If the trace unit reports a branch prediction event in a circuit whose hot path the compiler eliminated all branches from, it confirms the compiler model is correct — or flags a hardware anomaly in the CPU itself.
+
+3. **Execution plan validation.** A circuit that consistently executes faster than its declared budget can donate tick windows back to the runtime pool. A circuit that consistently approaches its budget boundary signals the `ObservabilityCircuit` before it becomes a violation. The runtime reacts through declared channels, not through forced intervention.
+
+On ARM specifically, the ETM (Embedded Trace Macrocell) provides this at silicon level with sub-cycle resolution. The clock-aware runtime treats it as a first-class subscription source — not a debug facility to be attached occasionally, but a permanently running circuit producing a continuous stream of hardware-sourced proofs.
+
+The trace unit is also the input to PGO. Real execution traces from production replace synthetic profiles. The next compilation ingests the trace, adjusts instruction ordering and register allocation to match actual hotspots, and produces a binary that is provably better than the previous one — not heuristically better. The trace is a theorem input.
+
 ---
 
 ## Memory
@@ -671,6 +701,50 @@ The `NamespaceCircuit` maps identifiers — circuit names, handoff keys, manifes
 There is no `VFS` layer. There is no `inode` table separate from the namespace. There is no `dentry` cache separate from the `Permanent` tier. There is no `fsync` — the write-commit cycle boundary *is* the sync. A programme that holds a `Cold<T>` handle is subscribed to that region; when it drops the handle (removes the subscription), the runtime releases the region back to the `NamespaceCircuit`. There is no file descriptor table. There is no `open file description`. There is a typed channel subscription — the same primitive used for every other resource in the system.
 
 The filesystem was always a cache manager bolted on top of block I/O with a namespace on top. When the cache manager is the runtime, the block I/O is the driver circuit, and the namespace is one more OS circuit, the filesystem disappears as a concept — and what remains is simpler, faster, and fully verified by the same compiler that verifies everything else.
+
+### Atoms — The Audit and Adaptation Unit
+
+An **atom** is the smallest observable unit of execution in the clock-aware model: one circuit, one cycle window, one tick. Every instruction executed within that window, every register touched, every channel read or written — all of it is attributed to a single atom. The trace unit (see `### The Trace Unit`) emits one `TraceEvent` per atom.
+
+Atoms serve two purposes:
+
+**Audit.** Every atom is a self-describing unit: it carries the circuit identity, the tick, the core, the execution cost, and whether the execution plan was honoured. A sequence of atoms is a complete, tamper-evident, instruction-level audit log of the system's execution. Forensic analysis of any production incident reduces to replaying the atom stream up to the incident tick and inspecting state at any point. There is no sampling. There is no inference. The record is complete.
+
+**Adaptation.** Atoms are also the training signal for the runtime's ML-based execution planner. The runtime maintains a model of each circuit's actual behaviour — how often it uses its full budget, how often it finishes early, which channels it reads first, how its cost varies by input pattern. This model is updated continuously from the atom stream. The runtime uses it to make two kinds of real-time decisions:
+
+| Decision | Basis |
+|---|---|
+| Tick window sizing | If a circuit consistently uses 60% of its declared budget, the runtime can tentatively compress its window and reallocate the surplus — subject to the compiler's minimum bounds |
+| Core placement | If two circuits' atom streams show high channel affinity (producer/consumer in consecutive ticks), the runtime migrates them to adjacent cores to reduce handoff latency |
+
+These are not policy overrides. The compiler's timing proof remains the hard floor — the runtime can only tighten within the declared window, never exceed the declared budget. The ML model is the runtime's way of finding slack within the proof, not of relaxing the proof.
+
+### Hot and Cold Cores — Clock Model Assignment at Runtime
+
+Not all cores run at the same clock model. The runtime maintains a live utilisation map of every core and assigns a `clock_model` to each based on current load:
+
+| `clock_model` | Condition | Effect |
+|---|---|---|
+| `Performance` | Core is executing hot-path circuits at high utilisation | Maximum frequency, full pipeline depth, all execution ports active |
+| `Balanced` | Core is in mixed use — some hot, some background | Moderate frequency, reduced port count |
+| `Efficiency` | Core is executing only cold-path or background circuits | Minimum frequency sufficient for declared window — no excess power |
+| `Idle` | No circuits scheduled on this core this tick | Low-power state, clock gated |
+
+The assignment is made at clock-boundary granularity — not as a sustained mode, but as a per-tick decision derived from the dispatch table. The runtime knows, from the dispatch table, exactly which circuits will execute on each core in the next N ticks. It can pre-assign the `clock_model` for those ticks before they arrive. The core transitions power state between windows, not reactively to load spikes.
+
+This means the CPU is running at exactly the power level the declared workload requires — never more, never less. There is no DVFS governor sampling utilisation and guessing. The dispatch table is the workload declaration. The clock model follows from it, provably.
+
+A pipelined hot-path circuit arriving at a core that was in `Efficiency` mode triggers a pre-transition: the runtime, seeing the incoming circuit in the dispatch table, upgrades the core's `clock_model` to `Performance` one window before the circuit starts. The circuit never executes at reduced frequency. The transition is declared, not reactive.
+
+### The Runtime Adapts — AI-Regulated OS
+
+The atom stream, the ML execution planner, and the clock model assignment together form a system that adapts in real time to the actual workload — not by guessing, not by sampling, but by reading a hardware-sourced proof stream and acting on it within the constraints of the compiler's theorems.
+
+The logical conclusion of this architecture is that the OS itself can be regulated by an AI circuit: a declared `AdaptationCircuit` that subscribes to `Channel<AtomStream>`, runs inference over the execution history, and emits `Channel<RuntimeDirective>` — window size adjustments, core placement recommendations, clock model pre-assignments — that the runtime applies at the next dispatch boundary.
+
+This is not an AI that controls the OS in an unconstrained way. It is a circuit like any other circuit: declared timing, declared channels, compiler-verified. Its directives are bounded by the compiler's hard floor. It cannot make the system unsafe — the compiler already proved safety. It can only find and exploit slack that the static proof left on the table, because the static proof is conservative by necessity and the AI has the runtime's live data.
+
+The result is an OS that is simultaneously formally verified (by the compiler) and continuously optimised (by the AI circuit) — not a trade-off between the two, but both at once, at different layers.
 
 ---
 
@@ -801,6 +875,46 @@ The `org` field names the allocation. At compile time, the compiler verifies tha
 The consequence is that the trust boundary between organisations is enforced at the same level as the timing boundary: by the compiler and the dispatch table, not by a kernel permission check, not by a firewall rule, not by a service mesh policy. Two circuits from different organisations running on the same machine are as isolated as if they were on different machines — their memory locations are in disjoint allocations, their channel subscriptions are in disjoint key rings, and no wire between them can be declared without both sides presenting matching organisational signatures.
 
 This replaces container namespaces, cgroup isolation, SELinux policy, and inter-process privilege separation for the clock-aware model. Those mechanisms exist because processes share a kernel and an address space and must be prevented at runtime from accessing each other. Clock-aware circuits have no shared address space — they have declared memory tiers with named owners. There is nothing to prevent at runtime because the connection was never expressible in the first place.
+
+### The Cryptographic Proof Chain
+
+The manifest signatures form a **proof chain** analogous to an SSL certificate chain: each signed manifest is a certificate of correctness, signed by a known key, verified by the runtime before acceptance.
+
+```
+  Root of Trust (system.cap key ring)
+         │
+         ▼
+  Compiler signing key  ──signs──►  circuit manifest
+                                         │
+                                         │  contains
+                                         ▼
+                               timing proof
+                               memory proof
+                               channel proof
+                               compliance proof  (if declared)
+                               org key
+                                         │
+                                         ▼
+                               Runtime verifies signature
+                               against system.cap key ring
+                                         │
+                          ┌──────────────┴──────────────┐
+                          │                             │
+                    key known                      key unknown
+                    chain valid                    or chain broken
+                          │                             │
+                          ▼                             ▼
+                   circuit slotted              rejected at dispatch
+                   into dispatch table          boundary — no window
+                                                allocated, no channel
+                                                registered, no trace
+```
+
+The runtime maintains a **known key set** declared in `system.cap`. Only circuits signed by keys in this set can run on the system. There is no runtime key negotiation, no certificate authority to contact, no OCSP check. The key ring is compiled into the system configuration at build time. Adding a new allowed key requires a new `system.cap` build — which is itself a compiled, signed artefact.
+
+The consequence is that the set of circuits permitted to execute on a given machine is a compile-time declaration, not a runtime policy. A circuit that is not signed by a key in `system.cap` cannot execute — not because a runtime check blocked it, but because the dispatch table has no slot for an unverified manifest. The attack surface is the key ring declaration, not the runtime policy engine.
+
+This extends the timing proof chain to a trust proof chain. The compiler proves timing. The signing key proves provenance. The runtime verifies both before admitting any circuit. The system's security posture is as strong as its weakest proof — and both proofs are compile-time artefacts.
 
 **The invariant the compiler maintains:**
 
