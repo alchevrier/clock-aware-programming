@@ -131,6 +131,27 @@ The freed area — 70–90% of the current die — is reinvested into:
 
 The result is a processor that performs more computation per transistor than any OOO processor — because every transistor performs computation, and none performs prediction.
 
+**The root cause of the over-provisioning is the OS stall.** When the OS stalls — context switches, syscall latency, GC pause, scheduler jitter, interrupt handling, page fault — the CPU cannot do useful work. The hardware has no way to know the stall is coming, so it must be provisioned for the peak throughput the application demands, not the average throughput it actually delivers. The L3 cache is large because the OS might evict working sets during a stall. The OOO engine is deep because the OS might delay instruction delivery. The branch predictor is complex because control flow through the OS is unpredictable. Every layer of hardware compensation exists, in part, to recover performance that the OS stole.
+
+In the clock-aware model there are no stalls. There is no scheduler jitter because the scheduler is the clock. There is no GC pause because there is no GC. There is no syscall latency because there are no syscalls. There is no page fault because every access is declared. The hardware does not need to compensate for OS behaviour it cannot predict — because the OS behaviour is fully declared and already proven not to interfere with the circuit's declared windows. The hardware schematics simplify dramatically:
+
+| Hardware component | Conventional purpose | Clock-aware fate |
+|---|---|---|
+| L3 cache (50–60% of die) | Buffer against OS-induced working set eviction | Eliminated — working set is L1-pinned by declaration |
+| OOO engine (10–15%) | Recover IPC lost to pipeline stalls from unpredictable control flow | Eliminated — instruction order is compiler-optimal |
+| Branch predictor (5–10%) | Compensate for branches the compiler never resolved | Eliminated — hot path is branch-free by construction |
+| Deep ROB / reservation station | Hide latency from memory stalls and mispredictions | Eliminated — no stalls, no mispredictions |
+| TLB (virtual memory hardware) | Support address space isolation between OS processes | Eliminated — circuits use declared physical tiers, no virtual addresses |
+| Interrupt controller complexity | Deliver async hardware events to an OS that isn't listening | Simplified to DREQ → DMA → channel write — no async delivery |
+
+The CPU that remains is not a simplified version of a modern CPU. It is a different class of machine: a deep execution pipeline with a large register file, wide issue ports, and a precisely-sized L1 — nothing else. The schematic is simpler than anything built since the early RISC era, but faster than anything that has ever run, because every transistor it has is doing computation.
+
+**The same logic applies to core count.** Today's CPUs need fewer, higher-quality cores — and those cores need to be engineered to extreme performance — precisely because each core gets stalled. When a core stalls, it stops contributing. To hit a throughput target, you need enough cores that the surviving non-stalled cores can cover for the ones that are waiting. The response to stall-induced throughput loss is to make each individual core faster and more resilient — deeper OOO window, larger ROB, higher clock rate, more speculative headroom — so it recovers faster from each stall. The core becomes more complex and more expensive to manufacture because it must compensate for the OS's behaviour.
+
+In the clock-aware model, cores do not stall. A core that does not stall does not need a deep OOO window to recover. It does not need a large ROB. It does not need aggressive branch prediction. It needs a deep pipeline and wide execution ports — which are simpler to manufacture, cheaper per core, and have better yield because the transistor structures are regular and predictable rather than the irregular, state-heavy logic of a speculative engine.
+
+The manufacturing consequence is direct: the same die budget that produces 16 high-quality, stall-tolerant OOO cores today produces 80–120 simpler, stall-free clock-aware cores. Each individual core is less powerful in isolation. But it never stalls — so it delivers its declared throughput continuously, not intermittently. 80 cores running continuously at their declared rate outperform 16 cores running at peak rate between stalls by a margin that the atom stream can prove, tick by tick.
+
 ---
 
 ## The Compounding Gain from Process Scaling
@@ -160,6 +181,94 @@ The Apple M-series is cheaper because unified memory removes the VRAM/DRAM bound
 A clock-aware CPU with declared memory tiers eliminates the boundary architecturally. The inference engine and the application processor share the same memory pool — not as an engineering compromise, but as a consequence of the model: all access patterns are declared, so there is no reason to separate the pools. The hardware cost of running a large model is the hardware cost of enough DRAM to hold the weights, plus the execution units to process them. No discrete GPU. No PCIe interconnect. No memory copies across the boundary.
 
 The cost reduction from OOO elimination and VRAM/DRAM unification, combined with the higher core count per die area, implies a 3–4× reduction in hardware cost for equivalent inference throughput compared to a GPU-based system. Not because the hardware became cheaper per transistor — it did not — but because the transistors that remain all perform computation rather than prediction.
+
+### Speculative Cost After Adopting the Clock-Aware Model
+
+The following is a speculative but derivable estimate of what equivalent inference capability costs once the clock-aware architecture is in production silicon. The baseline is a 70B parameter model at production serving throughput.
+
+| System | Configuration | Estimated cost | Bottleneck |
+|---|---|---|---|
+| **Today — GPU-based** | 2× NVIDIA A100 80GB + host server | ~HK$180,000 | VRAM capacity, PCIe bandwidth, OOO overhead |
+| **Today — Apple M-series** | Mac Studio Ultra (192GB unified) | ~HK$40,000 | OOO overhead, memory bandwidth shared with CPU |
+| **Clock-aware Gen 1** *(commodity silicon, software model only)* | Existing AArch64 server, clock-aware runtime, no custom silicon | ~HK$15,000 | ISA legacy overhead, no hardware specialisation |
+| **Clock-aware Gen 2** *(custom silicon, declared tiers)* | Clock-aware CPU, HBM4 Task tier, LPDDR6 Session tier, no discrete GPU | ~HK$8,000 | Memory bandwidth (no other bottleneck — all eliminated) |
+| **Clock-aware Gen 2 + GPU ALU array** | Gen 2 CPU + specialised matmul/softmax silicon (no CUDA generality) | ~HK$5,000 | Pure compute throughput — all other overhead eliminated |
+
+The Gen 1 estimate reflects running the clock-aware software model on existing commodity hardware: no custom silicon, but the runtime eliminates OS overhead, removes the scheduler jitter, pre-allocates memory, and eliminates GC. The performance improvement comes purely from software — the hardware is unchanged. The cost reduction comes from not needing discrete GPUs, because the unified memory and the optimised runtime together bring inference within reach on a standard server.
+
+The Gen 2 estimate reflects what happens when the hardware is redesigned for the model: OOO engine eliminated (→ more cores), L3 eliminated (→ more execution ports), coherency hardware eliminated (→ simpler die), VRAM/DRAM boundary eliminated (→ one pool). The 80–120 clock-aware cores per die replace 16 OOO cores, at lower manufacturing cost per core and better yield. The HBM4 tier is sized only for the declared `Task`-scoped working set — a fraction of what a GPU's VRAM pool requires.
+
+The Gen 2 + GPU ALU array estimate reflects replacing CUDA cores with operation-class-specialised units: the matmul array, the softmax reduction tree, the cordic pipeline. No generalisation tax. Every transistor in the accelerator does exactly the operation the declared workload requires.
+
+To put this in concrete terms: **Gen 2 brings the highest-quality AI models within reach as local agents for ~HK$5,000**. A 70B parameter model running on a Gen 2 clock-aware machine — with HBM4 for the declared working set, LPDDR6 for session state, and a specialised matmul array — runs at production serving throughput on hardware that costs less than a high-end consumer laptop today. Not in a data centre. Not behind an API. On a machine you own, with a signed manifest that proves what it is running, at what timing, under what compliance constraints. The atom stream is the audit log. The cryptographic proof chain is the identity. The compiler is the gatekeeper. The model runs locally, verifiably, and continuously — without a cloud subscription, without data leaving the machine, and without trusting anyone's infrastructure except the silicon you can physically inspect.
+
+The broader consequence is the democratisation of serious compute. Today, running a frontier AI model in production requires either a cloud budget measured in thousands of dollars per month or a capital investment in GPU infrastructure measured in hundreds of thousands. Both gatekeep who can build production-grade AI systems. Gen 2 removes that gate: a solo developer, a small team, a researcher with limited funds can own hardware that runs the highest-quality models locally, continuously, at production throughput. An idea that today requires a data centre contract can be put to life on a machine that costs less than a month of GPU cloud spend. The cost of turning an idea into a running system drops by an order of magnitude — and the system that runs it is more verifiable, more auditable, and more correct than anything running in the cloud today.
+
+These are speculative estimates, not product specifications. The derivation is: remove each hardware component that exists only to compensate for undeclared timing, replace it with computation, count the transistors saved, and price them at current fab cost per mm². The direction is not speculative. The magnitude is.
+
+There is a further compounding dynamic that does not appear in these numbers: **the clock-aware processor manufactures its own successor**. A Gen 1 machine running frontier models locally generates atom streams — continuous, cycle-accurate records of every operation, every memory access, every declared workload. Those atom streams are the highest-quality dataset that has ever existed for silicon design: not benchmarks, not synthetic traces, but real execution at production throughput on real workloads with ground-truth timing. The ML substrate described in Paper III closes the loop — the atom stream trains the models, the models produce directives, the compiler incorporates them — but the same loop applies to the chip itself. Chip designers using Gen 1 hardware to run EDA tools, placement algorithms, and timing analysis on atom stream data from the previous generation will produce Gen 2 silicon that is cheaper, more efficient, and more precisely fitted to declared workloads than anything designed against synthetic benchmarks today. Gen 2 produces Gen 3 at lower cost still. Each generation's atom stream is a more complete characterisation of the workload space than any prior generation's benchmarks. The cost curve does not flatten — it accelerates downward. The ~HK$5,000 figure for Gen 2 is not a floor; it is a ceiling on what the first generation of this feedback loop will achieve.
+
+The feedback loop extends into the fab itself. A clock-aware processor produces an atom stream from every operation it executes, including EDA workloads, timing analysis, and placement runs. Those streams characterise, at cycle resolution, exactly how the workload exercises the silicon. That same resolution — applied to the manufacturing process — enables something that no current fab does systematically: **running ML live during fabrication to correct defects as they form**. Today, yield improvement is a statistical process: expose a wafer, measure the batch, adjust the recipe for the next run. The defect and the correction are separated by an entire production cycle. With a clock-aware substrate driving the fab's own metrology circuits — etch depth sensors, alignment cameras, thermal monitors, each declared as `ReadOnlyDevice<T>` channels — the atom stream captures every measurement at every deposition and etch step. An ML model trained on prior atom streams predicts which sites are drifting toward a defect class before the defect is complete, and the fab's actuator circuits — laser power, gas flow, chuck temperature — receive a corrective directive within the same declared clock window. The defect is corrected in the same run it is forming. Yield improves not batch-to-batch but wafer-to-wafer, then die-to-die. The same model that closes the software execution loop closes the hardware manufacturing loop. The atom stream is not just a dataset for designing the next chip; it is the control signal for building the current one correctly.
+
+```
+FAB PROCESS — LIVE ML CORRECTION LOOP
+──────────────────────────────────────────────────────────────────────────────
+
+  FABRICATION STEPS                    METROLOGY DEVICES (declared channels)
+  ─────────────────                    ─────────────────────────────────────
+  Deposition          ──────────────►  ReadOnlyDevice<EtchDepth>
+  Etch                ──────────────►  ReadOnlyDevice<AlignmentDelta>
+  Lithography         ──────────────►  ReadOnlyDevice<ThermalMap>
+  CMP                 ──────────────►  ReadOnlyDevice<SurfaceUniformity>
+                                                   │
+                                                   │  atom stream
+                                                   ▼
+                                        ┌──────────────────┐
+                                        │   ATOM STREAM    │
+                                        │  (cycle-accurate │
+                                        │  measurement log)│
+                                        └────────┬─────────┘
+                                                 │
+                               ┌─────────────────▼──────────────────┐
+                               │           ML MODEL                  │
+                               │  trained on prior generation atoms  │
+                               │  predicts: site drifting toward     │
+                               │  defect class? → severity estimate  │
+                               └─────────────────┬──────────────────┘
+                                                 │  directive (same clock window)
+                                                 ▼
+                                   ACTUATOR CIRCUITS (declared channels)
+                                   ─────────────────────────────────────
+                                   WriteOnlyDevice<LaserPower>
+                                   WriteOnlyDevice<GasFlow>
+                                   WriteOnlyDevice<ChuckTemperature>
+                                                 │
+                                                 ▼
+                                      CORRECTION APPLIED
+                                   (within the same deposition
+                                    or etch step — not next batch)
+
+  TODAY (statistical)          │   CLOCK-AWARE (continuous)
+  ─────────────────────────    │   ─────────────────────────────────
+  Expose wafer                 │   Measure at every step (atom stream)
+  Measure batch after          │   ML predicts drift before defect forms
+  Adjust recipe for next run   │   Actuator corrects within same window
+  Defect ↔ correction: 1 run  │   Defect ↔ correction: 1 clock cycle
+  Yield improves batch-to-batch│   Yield improves die-to-die
+
+                    ┌─────────────────────────────────────┐
+                    │  INTER-GENERATION FEEDBACK          │
+                    │                                     │
+                    │  Gen N atom streams                 │
+                    │    → train EDA + fab ML models      │
+                    │    → Gen N+1 chip designed cheaper  │
+                    │    → Gen N+1 fab runs cleaner yield │
+                    │    → Gen N+1 atom streams richer    │
+                    │    → repeat                         │
+                    │                                     │
+                    │  Cost curve: accelerates downward   │
+                    └─────────────────────────────────────┘
+```
 
 ---
 

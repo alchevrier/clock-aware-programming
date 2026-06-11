@@ -3,6 +3,12 @@
 
 > One primitive — declared operation timing — propagates upward to eliminate an operating system, and downward to redesign silicon.
 
+---
+
+*The thinking in these papers is mine. The writing was produced with AI assistance (GitHub Copilot / Claude). I am not a professional researcher or academic — I am someone who followed an idea to its logical conclusion and wrote down what I found.*
+
+---
+
 **Started: 2026-06-07.**
 
 ---

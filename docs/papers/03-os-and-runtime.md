@@ -25,6 +25,18 @@ The closest analogy in hardware is a bitstream loader. An FPGA bitstream loader 
 
 The compiler is Vivado. The manifest is the bitstream. The dispatch table is the fabric. The clock is the clock. The analogy is not approximate — it is the same model applied in software.
 
+**The compiler and the runtime are intentionally separate.** This is not a gap in the model — it is the model's correct factoring. Developers compile on their own machines. The manifest — a signed, self-contained proof artefact — is what ships to the production server. The runtime on the production server never runs the compiler. It receives the manifest, verifies the cryptographic signature against the key ring in its `system.cap`, checks that the declared resource profile fits the production machine's declared capacity, and loads the circuit into the dispatch table. If any check fails, the manifest is rejected before a single window is allocated. The compiler is not present at runtime. It does not need to be. The proof travels with the manifest.
+
+This separation is the same separation that makes hardware distribution work: Vivado runs on the engineer's workstation; the bitstream ships to the FPGA on the target board; the board does not need Xilinx software to run. The compiler's job ends when the proof is signed. The runtime's job begins when the proof arrives. They share nothing except the manifest format and the `system.cap` schema — and both of those are versioned, declared, and verifiable.
+
+The roles are precisely distinct. The compiler **proves feasibility**: given this hardware model, this circuit fits, this budget holds, this L1 footprint is resident, this compliance target is met. The proof is static, complete, and produced once. The runtime **enforces it**: at every clock edge, on every core, in every tick, the dispatch table is executed and the atom stream records what actually happened. The compiler's proof is a certificate of what should happen. The runtime's atom stream is a certificate of what did happen. Both are cryptographically signed. Neither is optional.
+
+The atom stream is therefore a continuous audit log — not a debug facility, not an optional trace, but a permanent, hardware-sourced record of every enforcement decision the runtime made. It is available at all times: to the `ObservabilityCircuit` for live monitoring, to the `AdaptationCircuit` for ML-driven optimisation, to external audit tools that subscribe to `Channel<AtomStream>`, and to post-incident forensic analysis that can replay any tick from any point in the system's history. A regulator, a certifier, or a security auditor can verify, from the atom stream alone, that every declared timing constraint was honoured, every circuit ran under its correct key, and every handoff completed within its declared staleness bound — not as a claim, but as a cryptographically verifiable sequence of hardware-sourced measurements.
+
+The same mechanism is directly valuable to semiconductor manufacturers for yield control. Every chip that runs a clock-aware system is continuously comparing its actual execution latencies against the declared microarchitecture model in `system.cap`. A chip that consistently executes within the declared latency bounds is verified silicon — it is meeting its speed grade in production, under real workload, not just under synthetic test vectors at the factory. A chip that shows a systematic delta — every L1 access costs 1.1 cycles instead of 1.0, every branch unit resolves in 2 cycles instead of 1 — is a chip whose actual silicon characteristics differ from its declared model. That delta is measurable, attributable, and continuous.
+
+The consequence for manufacturers is a feedback loop that has never before existed: field measurements of actual silicon behaviour, at instruction granularity, from every deployed chip, aggregated back to the process characterisation team. Not sampled. Not estimated from test chips. From every production chip, in every deployment, every tick. A systematic shift in field measurements across a production batch identifies a process deviation before it becomes a customer-visible failure. A marginal chip that passes factory test but drifts under sustained thermal load is identified in the field, from the atom stream, before it causes an incident. The atom stream is a continuous, hardware-sourced yield monitor — and it requires no additional silicon, no test equipment, and no factory involvement. It is a consequence of running a clock-aware system.
+
 ### The Compiler Produces a Complete Static Resource Profile
 
 When the compiler compiles a circuit it does not only produce executable code. It produces a complete, static, ahead-of-time picture of everything the circuit will ever use during its lifetime. This profile is part of the manifest — the bitstream the runtime loads.
@@ -785,6 +797,29 @@ The assignment is made at clock-boundary granularity — not as a sustained mode
 This means the CPU is running at exactly the power level the declared workload requires — never more, never less. There is no DVFS governor sampling utilisation and guessing. The dispatch table is the workload declaration. The clock model follows from it, provably.
 
 A pipelined hot-path circuit arriving at a core that was in `Efficiency` mode triggers a pre-transition: the runtime, seeing the incoming circuit in the dispatch table, upgrades the core's `clock_model` to `Performance` one window before the circuit starts. The circuit never executes at reduced frequency. The transition is declared, not reactive.
+
+**The asymmetry between hot-core speed and data arrival rate has a direct consequence for die design.** Hot cores process so fast — nanoseconds per circuit window — that data simply does not arrive quickly enough to keep them fully occupied. A 10 Gbps NIC delivers one 1500-byte frame every 1.2 µs. A hot core running at 4 GHz executes 4800 cycles in that window. A well-pipelined packet processing circuit might use 200 of them. The remaining 4600 cycles the hot core sits idle between bursts.
+
+Because the compiler proves exactly how many hot-path cycles each circuit needs, the runtime knows this idle fraction precisely — not as a measurement, but as a theorem derived from the dispatch table. That idle fraction is not wasted. It is reclaimable. The runtime fills the gaps between hot-path bursts with cold-path circuits on the same core — observability, logging, namespace lookups, background maintenance — or it schedules those on dedicated cold cores running in `Efficiency` mode at a fraction of the power.
+
+The implication for the hardware architecture is that the optimal core mix is **few hot cores, many cold cores**:
+
+```
+  Die area budget fixed
+  ─────────────────────────────────────────────────────────
+  Conventional CPU:  many identical cores, all capable of hot-path
+                     → most cores underutilised most of the time
+                     → die area wasted on capability that is rarely used
+
+  Clock-aware CPU:   few HOT cores (Performance, full pipeline depth)
+                     many COLD cores (Efficiency, simple pipeline, low power)
+                     → hot cores handle bursts, proven to fit in their windows
+                     → cold cores handle everything else, continuously
+                     → more total processing units for the same die area
+                     → more total throughput for the same power envelope
+```
+
+A conventional CPU cannot make this choice because it cannot prove which workloads are truly hot and which are cold — it must assume any core might need to run anything. The clock-aware model makes the distinction compile-time: every circuit declares its tier, its budget, its timing. The hardware can be matched to the workload structure that the compiler proved, not to a worst-case generalisation of it. Fewer hot transistors. More cold transistors. More work done. Less power consumed.
 
 ### The Runtime Adapts — AI-Regulated OS
 
