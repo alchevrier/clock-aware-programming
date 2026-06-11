@@ -368,6 +368,12 @@ What it claims is: **under the declared preconditions, with declared margin, the
 
 The compiler problem is real. It is the implementation challenge. The idea is sound.
 
+### Irregular workloads are not a special case
+
+A common objection is that real-world workloads — web requests, database queries, user events — are irregular by nature. The response is simple: **every operation still arrives at a clock cycle.** Irregular inputs do not escape the clock; they simply consume varying amounts of the declared budget. The clock-aware model does not require predicting *which* path an irregular input will take — it requires declaring the *worst-case budget* for any path it could take. The compiler verifies that the worst-case path fits within the declared cycle ceiling. An irregular input that takes the fast path consumes fewer cycles and the remaining budget goes idle — that idle time is not waste, it is the margin that makes the worst-case proof valid. The clock does not wait for irregular inputs to become regular. Irregular inputs wait for the next clock edge like everything else.
+
+The cleaner way to state the invariant: **the clock is always ticking.** What the declared budget answers is not "when does data arrive?" — that is unknowable at compile time — but "when data arrives, how fast can we get from A to B, knowing everything we need to do in between?" Every operation between A and B is enumerable at compile time: the parsing step, the lookup, the transformation, the write. Their worst-case cycle costs are known from the microarchitecture model. Their sum is the budget. The compiler certifies that sum. The runtime enforces it. The irregularity is in the arrival time of the input — not in the declared cost of processing it.
+
 ---
 
 ## Origin
