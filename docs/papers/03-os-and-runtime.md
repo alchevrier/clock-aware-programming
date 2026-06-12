@@ -31,7 +31,7 @@ This separation is the same separation that makes hardware distribution work: Vi
 
 The roles are precisely distinct. The compiler **proves feasibility**: given this hardware model, this circuit fits, this budget holds, this L1 footprint is resident, this compliance target is met. The proof is static, complete, and produced once. The runtime **enforces it**: at every clock edge, on every core, in every tick, the dispatch table is executed and the atom stream records what actually happened. The compiler's proof is a certificate of what should happen. The runtime's atom stream is a certificate of what did happen. Both are cryptographically signed. Neither is optional.
 
-The atom stream is therefore a continuous audit log — not a debug facility, not an optional trace, but a permanent, hardware-sourced record of every enforcement decision the runtime made. It is available at all times: to the `ObservabilityCircuit` for live monitoring, to the `AdaptationCircuit` for ML-driven optimisation, to external audit tools that subscribe to `Channel<AtomStream>`, and to post-incident forensic analysis that can replay any tick from any point in the system's history. A regulator, a certifier, or a security auditor can verify, from the atom stream alone, that every declared timing constraint was honoured, every circuit ran under its correct key, and every handoff completed within its declared staleness bound — not as a claim, but as a cryptographically verifiable sequence of hardware-sourced measurements.
+The atom stream is therefore a continuous audit log — not a debug facility, not an optional trace, but a permanent, hardware-sourced record of every enforcement decision the runtime made. It is available at all times: to the `ObservabilityCircuit` for live monitoring, to the `AdaptationCircuit` for ML-driven optimisation, to external audit tools that subscribe to `channel AtomStream`, and to post-incident forensic analysis that can replay any tick from any point in the system's history. A regulator, a certifier, or a security auditor can verify, from the atom stream alone, that every declared timing constraint was honoured, every circuit ran under its correct key, and every handoff completed within its declared staleness bound — not as a claim, but as a cryptographically verifiable sequence of hardware-sourced measurements.
 
 The same mechanism is directly valuable to semiconductor manufacturers for yield control. Every chip that runs a clock-aware system is continuously comparing its actual execution latencies against the declared microarchitecture model in `system.cap`. A chip that consistently executes within the declared latency bounds is verified silicon — it is meeting its speed grade in production, under real workload, not just under synthetic test vectors at the factory. A chip that shows a systematic delta — every L1 access costs 1.1 cycles instead of 1.0, every branch unit resolves in 2 cycles instead of 1 — is a chip whose actual silicon characteristics differ from its declared model. That delta is measurable, attributable, and continuous.
 
@@ -44,9 +44,9 @@ When the compiler compiles a circuit it does not only produce executable code. I
 **Port utilisation timeline.** For every channel the circuit subscribes to, the compiler knows exactly when it reads and when it writes: which tick within which window, at what frequency, producing or consuming what type. The profile is a timeline, not a set of bounds:
 
 ```
-channel  Channel<RawMessage>   read    tick 0    of every 12-tick window  (consumer)
-channel  Channel<Price>        write   tick 10   of every 12-tick window  (producer)
-channel  Channel<HandoffLatency> write tick 11   of every 12-tick window  (observability)
+channel  channel RawMessage   read    tick 0    of every 12-tick window  (consumer)
+channel  channel Price        write   tick 10   of every 12-tick window  (producer)
+channel  channel HandoffLatency write tick 11   of every 12-tick window  (observability)
 ```
 
 The runtime loads this profile and hands it to the observability sub-circuit, which uses it as the baseline: if a read or write does not appear at the declared tick, the deviation is itself an observable event. The port utilisation data the observability sub-circuit reports is not sampled — it is the delta between the declared timeline and the measured one.
@@ -70,7 +70,7 @@ The consequence is that the system's complete resource utilisation — across al
 
 The obvious objection: real applications have dynamic memory. User input is variable length. Network payloads vary. A JSON document arriving over a socket has no fixed size. A compile-time resource profile cannot accommodate data whose size is not known until runtime.
 
-The resolution is already in the model: dynamic data flows through a `Channel<T>`. A channel has a declared size — the ring buffer capacity — fixed at compile time. The data inside the channel is bounded by that size. If the payload is larger than one channel element, it is segmented — multiple elements, same channel, declared capacity. The channel is the declared bound; the content is the runtime value within that bound.
+The resolution is already in the model: dynamic data flows through a `channel T`. A channel has a declared size — the ring buffer capacity — fixed at compile time. The data inside the channel is bounded by that size. If the payload is larger than one channel element, it is segmented — multiple elements, same channel, declared capacity. The channel is the declared bound; the content is the runtime value within that bound.
 
 This is not a restriction. It is a clarification of what "dynamic" means. In a conventional system, dynamic memory means: the programmer does not know at compile time how much memory will be needed, so the runtime must provide it on demand from a heap of unknown size. In the clock-aware model, "dynamic" means: the value's content is not known at compile time, but its maximum size is declared — because a circuit that could consume unbounded memory has an undeclared timing contract, and an undeclared timing contract is a compile error.
 
@@ -78,13 +78,13 @@ The practical consequence:
 
 | Conventional dynamic pattern | Clock-aware equivalent |
 |---|---|
-| `Vec<u8>` growing unboundedly | `Channel<Frame>` with declared `size = 4096` |
-| `String` of unknown length | `Channel<Byte>` or segmented `Channel<Chunk>` with declared capacity |
+| `Vec<u8>` growing unboundedly | `channel Frame` with declared `size = 4096` |
+| `String` of unknown length | `channel Byte` or segmented `channel Chunk` with declared capacity |
 | `HashMap` growing at runtime | `FlatMap<K,V>` with declared `size` — maximum key count declared |
-| Dynamic JSON parse tree | `Channel<JsonToken>` — streaming tokeniser, fixed buffer, no tree allocation |
+| Dynamic JSON parse tree | `channel JsonToken` — streaming tokeniser, fixed buffer, no tree allocation |
 | Recursive data structure | Iterative traversal over declared-size collection — recursion depth is timing; declare it |
 
-A streaming JSON parser is the clearest example. A conventional parser builds a tree on the heap — unbounded allocation, unknown depth, unknown lifetime. A clock-aware parser reads tokens from `Channel<RawByte>` and writes structured events to `Channel<JsonToken>` — one token at a time, fixed buffer sizes, no allocation, no tree. The application receives a stream of typed events and processes each one in its declared window. The document may be arbitrarily large; the memory footprint is constant and declared.
+A streaming JSON parser is the clearest example. A conventional parser builds a tree on the heap — unbounded allocation, unknown depth, unknown lifetime. A clock-aware parser reads tokens from `channel RawByte` and writes structured events to `channel JsonToken` — one token at a time, fixed buffer sizes, no allocation, no tree. The application receives a stream of typed events and processes each one in its declared window. The document may be arbitrarily large; the memory footprint is constant and declared.
 
 For genuinely unbounded data — a file upload with no declared maximum, a stream that never terminates — the channel's declared `size` is the processing window. The circuit processes `size` elements per window and requests more in the next window. The throughput is bounded by the declared window frequency, not by memory. The circuit's memory footprint remains constant regardless of total data volume.
 
@@ -98,11 +98,11 @@ The model resolves it cleanly for the majority of SQL operations — and honestl
 
 **What works without compromise:**
 
-Streaming queries. The database circuit produces `Channel<Row>` with a declared buffer size — say, 1024 rows. The consumer processes each batch in its declared window and reads the next batch in the following window. The total result set may be arbitrarily large; the memory footprint is `1024 × sizeof(Row)`, declared at compile time. The frontend streams the same channel — rendering rows as they arrive, never holding the full result in memory. Aggregations — `COUNT`, `SUM`, `AVG`, `MIN`, `MAX` — run in a single streaming pass. No materialisation. Declared footprint.
+Streaming queries. The database circuit produces `channel Row` with a declared buffer size — say, 1024 rows. The consumer processes each batch in its declared window and reads the next batch in the following window. The total result set may be arbitrarily large; the memory footprint is `1024 × sizeof(Row)`, declared at compile time. The frontend streams the same channel — rendering rows as they arrive, never holding the full result in memory. Aggregations — `COUNT`, `SUM`, `AVG`, `MIN`, `MAX` — run in a single streaming pass. No materialisation. Declared footprint.
 
 **What requires a declared maximum:**
 
-`ORDER BY` on an unbounded result set requires materialising the full set before sorting — unless the data is pre-sorted at write time, or unless the sort is pushed into the database circuit and applied at ingestion. If the application must sort at query time on an arbitrarily large result, it must declare a maximum: `FlatMap<RowKey, Row>` with `size = 100_000`. If the result exceeds that maximum, the circuit emits a `Channel<TruncationEvent>` — a declared signal, handled by the exhaustive match, not a silent overflow. The programmer must decide: declare a maximum and acknowledge truncation, or re-architect the query to push the sort upstream.
+`ORDER BY` on an unbounded result set requires materialising the full set before sorting — unless the data is pre-sorted at write time, or unless the sort is pushed into the database circuit and applied at ingestion. If the application must sort at query time on an arbitrarily large result, it must declare a maximum: `FlatMap<RowKey, Row>` with `size = 100_000`. If the result exceeds that maximum, the circuit emits a `channel TruncationEvent` — a declared signal, handled by the exhaustive match, not a silent overflow. The programmer must decide: declare a maximum and acknowledge truncation, or re-architect the query to push the sort upstream.
 
 This is not a failure of the model. It is the model being honest about what the programme is doing. A sort on an unbounded result set has undeclared memory — the model requires it to be declared. The conventional alternative is a heap that silently grows until the process is killed by the OOM killer. The clock-aware alternative is a declared maximum and an explicit truncation signal. The constraint is real; so is the conventional alternative's behaviour.
 
@@ -148,7 +148,7 @@ The runtime uses these weights in three situations:
 
 **Resource contention — core time.** When a new circuit's declared window cannot fit on any core without displacing an existing circuit's window, the runtime attempts to pack the new circuit alongside lower-weight circuits by compressing their inter-window gaps. If the gap is already at the minimum allowed by the coherency constraints, the new circuit is rejected — or the lowest-weight circuit is evicted to free the core time. The decision is deterministic from the weight table and the declared timing constraints.
 
-**Ongoing arbitrage — adaptive shedding.** The observability sub-circuit continuously compares actual port utilisation against the declared profile. When a circuit consistently underutilises its declared channel bandwidth or finishes well within its budget, the runtime can signal it via `Channel<ResourceAdvisory>` — a declared channel the circuit may subscribe to — suggesting it yield surplus tick windows back to the pool. The circuit's exhaustive match handles the advisory: it may reduce its declared footprint, defer non-critical work to `@Cold` windows, or ignore the advisory if the architect declared that circuit weight-exempt. The decision is always in the circuit's match, not in the runtime's policy.
+**Ongoing arbitrage — adaptive shedding.** The observability sub-circuit continuously compares actual port utilisation against the declared profile. When a circuit consistently underutilises its declared channel bandwidth or finishes well within its budget, the runtime can signal it via `channel ResourceAdvisory` — a declared channel the circuit may subscribe to — suggesting it yield surplus tick windows back to the pool. The circuit's exhaustive match handles the advisory: it may reduce its declared footprint, defer non-critical work to `@Cold` windows, or ignore the advisory if the architect declared that circuit weight-exempt. The decision is always in the circuit's match, not in the runtime's policy.
 
 The architect does not tune a runtime. They declare weights once in `system.cap` and the runtime's behaviour under pressure is fully determined by those declarations. Two deployments with different weight tables produce provably different eviction orders — both correct for their respective declarations. The behaviour under contention is not emergent. It is designed.
 
@@ -204,7 +204,7 @@ The trust chain is explicit: the package's declaration table is verified against
 
 The kernel is a collection of timed functions. Each has a declared core, a declared cycle budget, a declared channel subscription list. The kernel's IRQ handler is a timed function. The kernel's RCU reclaim is a timed function. The kernel's memory management is a timed function. Each writes into typed channels; each reads from typed channels; none preempts any other because their windows are declared non-overlapping.
 
-This is identical to an application function. The only distinction between a kernel function and an application function is the channel subscription list. Kernel functions subscribe to hardware-backed channels (`Channel<IrqSignal>`, `Channel<TimerTick>`). Application functions subscribe to logical channels (`Channel<NicFrame>`, `Channel<OrderDecision>`). In both cases the programmer writes the same channel API — the compiler resolves the physical backing from `system.cap`. Both are compiled with the same proc-macro, verified against the same `system.cap`, sealed into the same signed manifest.
+This is identical to an application function. The only distinction between a kernel function and an application function is the channel subscription list. Kernel functions subscribe to hardware-backed channels (`channel IrqSignal`, `channel TimerTick`). Application functions subscribe to logical channels (`channel NicFrame`, `channel OrderDecision`). In both cases the programmer writes the same channel API — the compiler resolves the physical backing from `system.cap`. Both are compiled with the same proc-macro, verified against the same `system.cap`, sealed into the same signed manifest.
 
 The runtime is not a separate thing that sits between the language and the kernel. The kernel is the runtime. Both are collections of declared-timing circuits, compiled and verified by the same toolchain.
 
@@ -212,7 +212,7 @@ The runtime is not a separate thing that sits between the language and the kerne
 
 The operating system is not a special-privileged process. It is a collection of declared-timing circuits, written in the language, compiled by the same toolchain, verified by the same compiler. Apart from the ~500 lines of Assembly stubs that handle boot and hardware initialisation, every line of the OS is a function or a class with a `@Timeslice` annotation, a lifetime type, and a channel subscription list.
 
-There is no privileged mode at the language level. The distinction between an OS circuit and an application circuit is the channel subscription list: OS circuits subscribe to hardware-backed channels (`Channel<IrqSignal>`, `Channel<TimerTick>`, `Channel<DmaCompletion>`); application circuits subscribe to logical channels (`Channel<NicFrame>`, `Channel<OrderDecision>`). The language is the same. The compiler is the same. The four rules are the same.
+There is no privileged mode at the language level. The distinction between an OS circuit and an application circuit is the channel subscription list: OS circuits subscribe to hardware-backed channels (`channel IrqSignal`, `channel TimerTick`, `channel DmaCompletion`); application circuits subscribe to logical channels (`channel NicFrame`, `channel OrderDecision`). The language is the same. The compiler is the same. The four rules are the same.
 
 ### Handoff: Declared Cycle Boundaries, Not Locks
 
@@ -228,7 +228,7 @@ The OS contains a layer of dedicated sub-circuits whose sole function is observa
 - **Subsystem registry** — which circuits are present in the current compiled configuration
 - **Active/idle status** — per-circuit: currently executing, waiting at cycle boundary, or idle (not configured)
 
-These sub-circuits do not poll. They produce `Channel<SystemSnapshot>` at a declared low-frequency cycle (e.g. every 100 ms). The observability data is always fresh — not sampled, not aggregated by a runtime monitor that wakes up occasionally — because the sub-circuits are always running in their declared windows. A circuit that fails to reach its cycle boundary produces a gap in the snapshot stream, which is itself an observable event.
+These sub-circuits do not poll. They produce `channel SystemSnapshot` at a declared low-frequency cycle (e.g. every 100 ms). The observability data is always fresh — not sampled, not aggregated by a runtime monitor that wakes up occasionally — because the sub-circuits are always running in their declared windows. A circuit that fails to reach its cycle boundary produces a gap in the snapshot stream, which is itself an observable event.
 
 This replaces `/proc`, `/sys`, `perf_event_open`, `eBPF`, and every observability layer bolted on after the fact — because those layers exist precisely because the original system did not declare what it was doing.
 
@@ -256,7 +256,7 @@ Running a program means dynamically adding a compiled circuit to the live system
 
 Every time the runtime adds a circuit, it adds it alongside the circuit that handles its error signal. The circuit manifest declares both as a pair — the main circuit and its error-handler circuit — and the runtime registers them atomically. The main circuit never begins execution without its error-handler already subscribed to its error channel. This is not optional and cannot be deferred: a circuit whose error-signal handlers are not compiler-verified does not compile. Adding a circuit and adding its error-handler are not two operations. They are one.
 
-The runtime supplies a default error-handler for every signal type. The default handlers are conservative: log the signal to the observability channel, remove the circuit cleanly, notify any declared dependents via `Channel<DependencyLost>`. A programmer who does not declare a custom handler gets this behaviour automatically — and the compiler records in the manifest which signals are handled by the default and which have an explicit override. A programmer who declares a custom error-handler circuit replaces the default for the specific signal types it covers; the remainder fall through to the default. There is no way to leave a signal type unhandled: either the programmer's handler covers it, or the default does.
+The runtime supplies a default error-handler for every signal type. The default handlers are conservative: log the signal to the observability channel, remove the circuit cleanly, notify any declared dependents via `channel DependencyLost`. A programmer who does not declare a custom handler gets this behaviour automatically — and the compiler records in the manifest which signals are handled by the default and which have an explicit override. A programmer who declares a custom error-handler circuit replaces the default for the specific signal types it covers; the remainder fall through to the default. There is no way to leave a signal type unhandled: either the programmer's handler covers it, or the default does.
 
 ```
                           ┌─────────────────────────────┐
@@ -268,7 +268,7 @@ The runtime supplies a default error-handler for every signal type. The default 
                           │  ┌────────────┐              │
               inputs ────►│  │   CIRCUIT  │──► outputs   │
                           │  └─────┬──────┘              │
-                          │        │ Channel<ErrorSignal> │
+                          │        │ channel ErrorSignal │
                           │        ▼                      │
                           │  ┌─────────────────────────┐ │
                           │  │     ERROR HANDLER        │ │
@@ -391,20 +391,20 @@ Each kernel circuit has a single, narrow responsibility:
 
 | Circuit | Responsibility | Exposes |
 |---|---|---|
-| `ClockCircuit` | Reads the hardware cycle counter (TSC). Calibrates it to wall-clock time. Does not drive the scheduler — the CPU clock does that directly. | `Channel<Tick>`, `Channel<WallClock>` |
-| `MemoryCircuit` | Pre-allocates memory regions at slot time. Manages tier promotion/demotion. Handles circuit removal and reclaim. | `Channel<SlotAck>`, `Channel<RemovalSignal>` |
-| `NicCircuit` | DMA-paced network I/O via the NIC driver. Delivers frames to subscriber circuits at declared cycles. | `Channel<EthernetFrame>` |
-| `NamespaceCircuit` | Maps names and identifiers to `Cold` tier regions. The filesystem namespace. | `Channel<ColdRegion>` |
-| `ObservabilityCircuit` | Publishes per-circuit utilisation, timing deltas, and system snapshots at a declared low-frequency window. | `Channel<SystemSnapshot>` |
-| `TerminalCircuit` | Reads keyboard input. Resolves names in the namespace. Calls `add_circuit`. Displays output. | `Channel<DisplayOutput>` |
+| `ClockCircuit` | Reads the hardware cycle counter (TSC). Calibrates it to wall-clock time. Does not drive the scheduler — the CPU clock does that directly. | `channel Tick`, `channel WallClock` |
+| `MemoryCircuit` | Pre-allocates memory regions at slot time. Manages tier promotion/demotion. Handles circuit removal and reclaim. | `channel SlotAck`, `channel RemovalSignal` |
+| `NicCircuit` | DMA-paced network I/O via the NIC driver. Delivers frames to subscriber circuits at declared cycles. | `channel EthernetFrame` |
+| `NamespaceCircuit` | Maps names and identifiers to `Cold` tier regions. The filesystem namespace. | `channel ColdRegion` |
+| `ObservabilityCircuit` | Publishes per-circuit utilisation, timing deltas, and system snapshots at a declared low-frequency window. | `channel SystemSnapshot` |
+| `TerminalCircuit` | Reads keyboard input. Resolves names in the namespace. Calls `add_circuit`. Displays output. | `channel DisplayOutput` |
 
 `ClockCircuit` is worth dwelling on. In a conventional OS, the timer interrupt is what drives the scheduler: it fires periodically, the kernel preempts the running process, picks the next one. In the clock-aware model, the scheduler *is* the CPU clock — the dispatch table encodes who runs at which tick, and the clock advances it. `ClockCircuit` has nothing to do with scheduling. It is purely a source of time-as-a-value: circuits that need elapsed time, timeouts, or wall-clock timestamps subscribe to its channels. The scheduling mechanism and the timekeeping mechanism are completely separate, which is the correct factoring.
 
 ### Callable and Non-Callable Circuits
 
-Not all circuits are equal from the user's perspective. The OS circuit collection includes a `TerminalCircuit` — a circuit that subscribes to `Channel<KeyboardInput>`, parses commands, and dispatches to other circuits by name. It is the user-facing surface of the system. What it can dispatch to defines the distinction between circuit kinds:
+Not all circuits are equal from the user's perspective. The OS circuit collection includes a `TerminalCircuit` — a circuit that subscribes to `channel KeyboardInput`, parses commands, and dispatches to other circuits by name. It is the user-facing surface of the system. What it can dispatch to defines the distinction between circuit kinds:
 
-**Callable circuits** are registered in the `NamespaceCircuit` with a public name. The terminal can look them up by name and invoke them via `add_circuit`. They produce output to a `Channel<DisplayOutput>` that the terminal subscribes to for the duration of their execution. They are the clock-aware equivalent of POSIX commands — `ls`, `cp`, `grep`, and any user-defined program that declares itself callable. A callable circuit is a first-class citizen of the namespace: it has a name, a manifest, a declared signature, and can be composed with other callable circuits via channel piping.
+**Callable circuits** are registered in the `NamespaceCircuit` with a public name. The terminal can look them up by name and invoke them via `add_circuit`. They produce output to a `channel DisplayOutput` that the terminal subscribes to for the duration of their execution. They are the clock-aware equivalent of POSIX commands — `ls`, `cp`, `grep`, and any user-defined program that declares itself callable. A callable circuit is a first-class citizen of the namespace: it has a name, a manifest, a declared signature, and can be composed with other callable circuits via channel piping.
 
 **Non-callable circuits** have no public name entry in the `NamespaceCircuit`. They cannot be invoked from the terminal. Two sub-kinds:
 
@@ -449,17 +449,17 @@ The terminal is itself a system circuit — it is not callable from itself. It i
 
 A driver is a circuit with a declared channel interface. Two structural kinds:
 
-**EventDrivenDriver** — subscribes to a hardware interrupt or DREQ assertion. Fires when the hardware signals readiness. Produces to a `Channel<T>` that application circuits can subscribe to.
+**EventDrivenDriver** — subscribes to a hardware interrupt or DREQ assertion. Fires when the hardware signals readiness. Produces to a `channel T` that application circuits can subscribe to.
 
 **MessageDrivenDriver** — transfers data through channels. Three orientations:
 
 | Orientation | Description |
 |---|---|
-| `ReadOnly` | Consumes from `Channel<T>`. Produces nothing. Used for write-only hardware: DAC, actuator, display. |
-| `WriteOnly` | Produces to `Channel<T>`. Consumes nothing. Used for read-only hardware: ADC, sensor, NIC RX. |
+| `ReadOnly` | Consumes from `channel T`. Produces nothing. Used for write-only hardware: DAC, actuator, display. |
+| `WriteOnly` | Produces to `channel T`. Consumes nothing. Used for read-only hardware: ADC, sensor, NIC RX. |
 | `BothWays` | Consumes from one channel, produces to another. Full-duplex hardware: SPI, UART, Ethernet with RX+TX. |
 
-A driver declares its channels, its timing constraints, and its DMA configuration. The compiler resolves the DMA ring buffer, the DREQ line, and the interrupt vector from the device descriptor in `system.cap`. The driver programmer writes `Channel<UartFrame>` — the compiler wires the UART DREQ to the DMA controller and delivers completed frames to the channel at the declared cycle. No manual DMA ring setup. No interrupt registration. No `request_irq`. No `dma_alloc_coherent`.
+A driver declares its channels, its timing constraints, and its DMA configuration. The compiler resolves the DMA ring buffer, the DREQ line, and the interrupt vector from the device descriptor in `system.cap`. The driver programmer writes `channel UartFrame` — the compiler wires the UART DREQ to the DMA controller and delivers completed frames to the channel at the declared cycle. No manual DMA ring setup. No interrupt registration. No `request_irq`. No `dma_alloc_coherent`.
 
 ### A Device Is a Class — A Stateful Circuit with Declared Signal Access
 
@@ -469,25 +469,25 @@ A device is more precisely a `class` — a stateful circuit whose register file 
 class ReadOnlyDevice<T> {
     // Device produces data. Kernel reads.
     // Input: hardware DREQ signal — is data ready?
-    // Output: Channel<T> — the data, delivered when DREQ asserts
+    // Output: channel T — the data, delivered when DREQ asserts
     val ready: Signal   // DREQ line — compiler monitors this
-    val out:   Channel<T>
+    val out:   channel T
 }
 
 class WriteOnlyDevice<T> {
     // Kernel sends data. Device consumes.
-    // Input: Channel<T> — data to send
+    // Input: channel T — data to send
     // Output: hardware accept signal — is the device ready to receive?
     val accept: Signal  // device's write-ready line
-    val in:     Channel<T>
+    val in:     channel T
 }
 
 class ReadWriteDevice<In, Out> {
     // Full-duplex. Both directions, independent signals.
     val ready:  Signal       // DREQ: device has data for kernel
     val accept: Signal       // device ready to receive from kernel
-    val in:     Channel<In>
-    val out:    Channel<Out>
+    val in:     channel In
+    val out:    channel Out
 }
 ```
 
@@ -496,14 +496,14 @@ The `Signal` is the DREQ line — a single hardware bit that answers the questio
 ```
   ReadOnlyDevice (e.g. NIC RX)
 
-  hardware ──► DREQ asserts ──► DMA transfers ──► Channel<EthernetFrame> written
+  hardware ──► DREQ asserts ──► DMA transfers ──► channel EthernetFrame written
                     │
                     └── compiler-wired: driver circuit fires on next clock edge
                                         after DREQ assertion, not before
 
   WriteOnlyDevice (e.g. DAC, actuator)
 
-  Channel<Sample> written ──► accept asserts? ──► DMA transfers ──► hardware
+  channel Sample written ──► accept asserts? ──► DMA transfers ──► hardware
                                     │
                                     └── compiler holds transfer until accept is high:
                                         never writes to a device that isn't ready
@@ -515,10 +515,10 @@ This completes the connection. The device declares its readiness via `Signal`. T
 
 The driver never polls. The driver never blocks. There is no path from hardware I/O to CPU that goes through a polling loop or a blocking syscall. Every hardware data transfer in the OS is a DMA operation, scheduled by the compiler, paced by the hardware's own DREQ signal.
 
-Application circuits cannot read hardware channels directly. They subscribe through the driver that owns the channel. The driver declares which `Channel<T>` it exposes and which subscriber identities are permitted, in its subscription list in `system.cap`:
+Application circuits cannot read hardware channels directly. They subscribe through the driver that owns the channel. The driver declares which `channel T` it exposes and which subscriber identities are permitted, in its subscription list in `system.cap`:
 
 ```
-driver.Uart0.exposes = Channel<UartFrame>
+driver.Uart0.exposes = channel UartFrame
 driver.Uart0.permits = [SerialLogger, DebugMonitor]
 ```
 
@@ -530,7 +530,7 @@ In the ARM memory model, **Gathering** means the hardware may merge multiple acc
 
 | Resource type | ARM attribute | Timing mechanism | Who enforces order |
 |---|---|---|---|
-| Normal memory, `Channel<T>` buffers, declared tiers | Gathering | Software-timed (window boundary) | Compiler |
+| Normal memory, `channel T` buffers, declared tiers | Gathering | Software-timed (window boundary) | Compiler |
 | Device registers, MMIO, DMA descriptor rings | Non-Gathering (`nGnRnE`) | Hardware-timed (DREQ signal) | Hardware |
 
 **Software-timed (Gathering) resources** are scheduled by the compiler. The hardware may merge and reorder accesses within a window because the compiler has already proved the ordering is safe across window boundaries. No barrier instruction is needed — the window boundary is the ordering proof.
@@ -543,11 +543,11 @@ The consequence: `dmb` / `dsb` / `isb` memory barrier instructions are absent fr
 
 The programmer does not need to explicitly subscribe to every channel. Subscription is inferred from how the channel is used:
 
-- **A channel passed as a function parameter** is subscribed by default. The compiler sees the function's declared signature, observes the `Channel<T>` parameter, and registers the subscription in the manifest automatically. No annotation required. If the calling circuit is not in the permitted subscriber list in `system.cap`, the registration is a compile error — but the subscription intent itself does not need to be declared separately from the type.
+- **A channel passed as a function parameter** is subscribed by default. The compiler sees the function's declared signature, observes the `channel T` parameter, and registers the subscription in the manifest automatically. No annotation required. If the calling circuit is not in the permitted subscriber list in `system.cap`, the registration is a compile error — but the subscription intent itself does not need to be declared separately from the type.
 
 - **A channel declared as internal state** has its role — publisher or consumer — inferred from usage. If the circuit writes to it, it is a publisher. If the circuit reads from it, it is a consumer. If the circuit does both, it is a state owner — a circuit that both produces and consumes the same channel (e.g. an accumulator or a ring buffer manager). The compiler derives the role from the declared operations, not from an annotation. A mismatch — a circuit declared to publish a channel it only reads — is a compile error.
 
-The result is that channel wiring is a consequence of the type system, not a separate declaration layer. The programmer writes functions that take and return `Channel<T>` values. The compiler builds the full subscription graph from the function signatures and usage patterns. The subscription graph is the routing table. It was always implicit in the code — the compiler makes it explicit and verifiable.
+The result is that channel wiring is a consequence of the type system, not a separate declaration layer. The programmer writes functions that take and return `channel T` values. The compiler builds the full subscription graph from the function signatures and usage patterns. The subscription graph is the routing table. It was always implicit in the code — the compiler makes it explicit and verifiable.
 
 ---
 
@@ -659,7 +659,7 @@ The two phases are distinct and must not be confused:
 
 **Runtime — slotting.** If the compiler says compatible, the runtime's job is mechanical: read the live counter, compute the phase offset, insert the new window boundaries into the dispatch table, register channel subscriptions. No arbitration. No negotiation. The compatibility was already proved. The runtime executes a theorem, not a policy.
 
-When multiple applications are already running, their interactions are exclusively through declared memory handoffs — values written at a declared tick boundary by one circuit and read at a declared tick boundary by another. The compiler already proved those handoffs valid for every existing circuit pair. Adding a new circuit that connects to an existing circuit via a declared `Channel<T>` extends the handoff graph by one edge. That edge is verified at compile time against the live timing: the new circuit's read window must open after the existing circuit's write window closes, accounting for the live phase offset. If it does, the handoff is valid by the same theorem as every other handoff in the system. There is no runtime arbitration — the memory location is not contested. One circuit writes at tick N. One circuit reads at tick N+k. The compiler proved k ≥ coherency latency. The hardware clock enforces it. The handoff is the arbitration.
+When multiple applications are already running, their interactions are exclusively through declared memory handoffs — values written at a declared tick boundary by one circuit and read at a declared tick boundary by another. The compiler already proved those handoffs valid for every existing circuit pair. Adding a new circuit that connects to an existing circuit via a declared `channel T` extends the handoff graph by one edge. That edge is verified at compile time against the live timing: the new circuit's read window must open after the existing circuit's write window closes, accounting for the live phase offset. If it does, the handoff is valid by the same theorem as every other handoff in the system. There is no runtime arbitration — the memory location is not contested. One circuit writes at tick N. One circuit reads at tick N+k. The compiler proved k ≥ coherency latency. The hardware clock enforces it. The handoff is the arbitration.
 
 ### The Performance Mechanism: Pipelining
 
@@ -686,10 +686,10 @@ For large `Permanent` or `Cold`-tier values — reference tables, ML weight tens
 **The system as a whole is a deeply pipelined machine.**
 
 ```
-core 2, tick  0–12:  parsePrice     → produces Channel<Price>   (Register lifetime)
-core 2, tick 12–22:  updateBook     → consumes Channel<Price>   (same core, register handoff, 0 cycles)
+core 2, tick  0–12:  parsePrice     → produces channel Price   (Register lifetime)
+core 2, tick 12–22:  updateBook     → consumes channel Price   (same core, register handoff, 0 cycles)
 core 2, tick 22–34:  emitQuote      → consumes OrderBook state  (Task lifetime, L1 pinned)
-core 0, tick 14–30:  riskCheck      → consumes Channel<Price>   (cross-core, gap ≥ coherency latency)
+core 0, tick 14–30:  riskCheck      → consumes channel Price   (cross-core, gap ≥ coherency latency)
 ```
 
 The compiler proves this pipeline is valid: every stage receives its input before its window opens, every stage finishes before its window closes, every handoff latency is absorbed in a compiler-computed gap. No pipeline stall is possible — because a stall would mean a circuit exceeded its budget, which is a compile error.
@@ -706,7 +706,7 @@ Each circuit executes on its own declared stack — not the hardware stack. The 
 
 ### The Trace Unit — Proving the Compiler Was Right
 
-On ARM (and equivalent architectures), the trace unit timestamps every instruction as it commits. The clock-aware runtime subscribes to the trace unit's output as a `Channel<TraceEvent>` through the `ObservabilityCircuit`. This gives the system something no conventional OS has ever had: a continuous, hardware-sourced, instruction-level audit of every circuit's actual execution.
+On ARM (and equivalent architectures), the trace unit timestamps every instruction as it commits. The clock-aware runtime subscribes to the trace unit's output as a `channel TraceEvent` through the `ObservabilityCircuit`. This gives the system something no conventional OS has ever had: a continuous, hardware-sourced, instruction-level audit of every circuit's actual execution.
 
 What the trace unit provides:
 
@@ -720,7 +720,7 @@ What the trace unit provides:
 | Speculation events | Confirms no speculative execution occurred outside declared bounds |
 | Pipeline stall events | Confirms no circuit exceeded its declared budget |
 
-The compiler emits an **execution plan** alongside the binary — the expected sequence of instruction timestamps, register values, and port utilisations for the hot path. The `ObservabilityCircuit` continuously compares the trace stream against the execution plan. A deviation is a `Channel<ExecutionPlanViolation>` signal: the specific instruction, the expected cycle, the actual cycle, and the delta.
+The compiler emits an **execution plan** alongside the binary — the expected sequence of instruction timestamps, register values, and port utilisations for the hot path. The `ObservabilityCircuit` continuously compares the trace stream against the execution plan. A deviation is a `channel ExecutionPlanViolation` signal: the specific instruction, the expected cycle, the actual cycle, and the delta.
 
 This produces three guarantees that no conventional system can make:
 
@@ -777,7 +777,7 @@ The programmer never sees this. They declare `Session<RiskLimitTable>` and write
 
 ### Unaligned Cache Lines — Compile-Time Padding
 
-The compiler detects structs whose declared fields would span a cache line boundary and automatically regroups and pads them to alignment. This is not a hint or a warning — it is a compile-time transformation. The compiler reads the `cpu_model`'s cache line size from `system.cap` (64 bytes on x86/ARM, 128 bytes on some POWER configurations) and arranges struct fields so that no single value straddles two cache lines. Values that would straddle are either reordered (where the reorder is semantics-preserving for the declared lifetime type) or padded with explicit fill bytes. The padded layout is emitted into the manifest alongside the circuit's memory footprint declaration. The runtime uses the padded layout for pre-allocation and for the DMA descriptor — hardware and software see the same physical layout. A struct that arrives from a network DMA with a misaligned layout is a compile error: the incoming `Channel<T>` type's layout must match the circuit's declared type exactly, and layout is part of the type.
+The compiler detects structs whose declared fields would span a cache line boundary and automatically regroups and pads them to alignment. This is not a hint or a warning — it is a compile-time transformation. The compiler reads the `cpu_model`'s cache line size from `system.cap` (64 bytes on x86/ARM, 128 bytes on some POWER configurations) and arranges struct fields so that no single value straddles two cache lines. Values that would straddle are either reordered (where the reorder is semantics-preserving for the declared lifetime type) or padded with explicit fill bytes. The padded layout is emitted into the manifest alongside the circuit's memory footprint declaration. The runtime uses the padded layout for pre-allocation and for the DMA descriptor — hardware and software see the same physical layout. A struct that arrives from a network DMA with a misaligned layout is a compile error: the incoming `channel T` type's layout must match the circuit's declared type exactly, and layout is part of the type.
 
 ### Out of Memory Is a Circuit Removal Event
 
@@ -787,13 +787,13 @@ In the clock-aware model there is no crisis. The runtime knows, before allocatin
 
 The removal protocol:
 
-1. **The runtime signals the circuit selected for removal.** The signal is delivered as a `Channel<RemovalSignal>` write — the same mechanism as any other inter-circuit communication. The selected circuit receives the signal at its next declared window open.
+1. **The runtime signals the circuit selected for removal.** The signal is delivered as a `channel RemovalSignal` write — the same mechanism as any other inter-circuit communication. The selected circuit receives the signal at its next declared window open.
 
-2. **The circuit acknowledges and completes its current window.** It does not abort mid-execution. Its current window runs to completion — the timing guarantee is not violated by removal. At the window close, the circuit writes a `Channel<RemovalAck>` back to the runtime.
+2. **The circuit acknowledges and completes its current window.** It does not abort mid-execution. Its current window runs to completion — the timing guarantee is not violated by removal. At the window close, the circuit writes a `channel RemovalAck` back to the runtime.
 
 3. **The runtime removes the circuit from the dispatch table.** Its windows are released. Its channel subscriptions are unregistered. Its entire declared working set — every `Session`, every `Task`, every `Permanent` value in its manifest — is reclaimed in a single manifest-walk. No scan. No pointer traversal. The runtime reads the manifest entries and releases the address ranges.
 
-4. **The cause is written to the observability log.** The removal event is a `Channel<CircuitEvent>` write to the observability sub-circuit, containing: circuit identity, removal cause (`OutOfMemory`), tier that was exhausted, bytes reclaimed, timestamp in ticks, and the identity of the circuit whose slot request triggered the removal. The log entry is structural — it is a typed channel write, not a string printed to stderr.
+4. **The cause is written to the observability log.** The removal event is a `channel CircuitEvent` write to the observability sub-circuit, containing: circuit identity, removal cause (`OutOfMemory`), tier that was exhausted, bytes reclaimed, timestamp in ticks, and the identity of the circuit whose slot request triggered the removal. The log entry is structural — it is a typed channel write, not a string printed to stderr.
 
 The runtime selects which circuit to remove by priority, declared in `system.cap`:
 
@@ -830,7 +830,7 @@ A traditional filesystem bundles three distinct concerns: block I/O, caching, an
   └─────────────────────┘
          │
          ▼
-  Channel<ColdRegion>   (returned to caller at declared cycle)
+  channel ColdRegion   (returned to caller at declared cycle)
 ```
 
 The `NamespaceCircuit` maps identifiers — circuit names, handoff keys, manifest hashes, application-level paths — to declared `Cold` regions. It holds no cache of its own; the tier system already promotes hot regions into DRAM. It performs no journaling in the traditional sense; durability is the declared write-commit policy of the `Cold` tier, enforced at the clock boundary by the NVMe driver circuit. It holds no locks; lookups are channel reads, writes are channel writes, and conflicting writes to the same region are resolved at the clock boundary by the runtime's ownership model.
@@ -913,7 +913,7 @@ On ARM, the hardware exposes several distinct clock inputs that the runtime maps
 | ARM clock signal | Purpose | Runtime mapping |
 |---|---|---|
 | `CLKIN` | Core clock — the fundamental execution tick | The base of every declared `@Timeslice` window. All cycle budgets are in `CLKIN` ticks. |
-| `CNTCLKEN` | Generic counter clock — drives `CNTVCT_EL0` (wall-clock counter) | The `ClockCircuit`'s `Channel<WallClock>` source. Frequency declared in `system.cap` as `cnt_freq_hz`. |
+| `CNTCLKEN` | Generic counter clock — drives `CNTVCT_EL0` (wall-clock counter) | The `ClockCircuit`'s `channel WallClock` source. Frequency declared in `system.cap` as `cnt_freq_hz`. |
 | `ATCLKEN` | Trace clock — drives the ETM (Embedded Trace Macrocell) | The `ObservabilityCircuit`'s trace source. Must be synchronised to `CLKIN` for sub-cycle resolution. |
 | `ACLKEN` | AXI bus clock — drives the interconnect | The DMA descriptor ring clock. Declared in `system.cap`; compiler verifies DMA transfer timing against AXI clock ratio. |
 
@@ -923,7 +923,7 @@ All four clocks are declared in `system.cap` with their frequencies and their re
 
 The ARM Accelerator Coherency Port (ACP) allows an accelerator — a GPU ALU array, a matmul unit, a DMA engine — to make coherent requests directly to the CPU's cache without involving the CPU. The accelerator reads or writes a cache line that the CPU has declared in its manifest, and the coherency protocol ensures the CPU sees a consistent view without a barrier instruction or a CPU-side flush.
 
-In the clock-aware model, ACP is the natural backing for cross-accelerator `Channel<T>` handoffs where the producer is a CPU circuit and the consumer is a declared accelerator circuit (or vice versa). The compiler, knowing both the CPU window and the accelerator's declared access window from `system.cap`, inserts the correct ACP coherency gap — derived from the ACP latency for the declared SoC — as a mandatory window-boundary constraint. The accelerator reads coherently from the CPU's L2, the CPU reads coherently from the accelerator's write buffer, and no software coherency management is needed. The handoff is proven at compile time. The ACP is the physical mechanism the runtime uses to execute that proof.
+In the clock-aware model, ACP is the natural backing for cross-accelerator `channel T` handoffs where the producer is a CPU circuit and the consumer is a declared accelerator circuit (or vice versa). The compiler, knowing both the CPU window and the accelerator's declared access window from `system.cap`, inserts the correct ACP coherency gap — derived from the ACP latency for the declared SoC — as a mandatory window-boundary constraint. The accelerator reads coherently from the CPU's L2, the CPU reads coherently from the accelerator's write buffer, and no software coherency management is needed. The handoff is proven at compile time. The ACP is the physical mechanism the runtime uses to execute that proof.
 
 ### Core Power Modes — Runtime Lifecycle
 
@@ -947,7 +947,7 @@ The consequence is that the runtime's power consumption tracks the declared work
 
 The atom stream, the ML execution planner, and the clock model assignment together form a system that adapts in real time to the actual workload — not by guessing, not by sampling, but by reading a hardware-sourced proof stream and acting on it within the constraints of the compiler's theorems.
 
-The logical conclusion of this architecture is that the OS itself can be regulated by an AI circuit: a declared `AdaptationCircuit` that subscribes to `Channel<AtomStream>`, runs inference over the execution history, and emits `Channel<RuntimeDirective>` — window size adjustments, core placement recommendations, clock model pre-assignments — that the runtime applies at the next dispatch boundary.
+The logical conclusion of this architecture is that the OS itself can be regulated by an AI circuit: a declared `AdaptationCircuit` that subscribes to `channel AtomStream`, runs inference over the execution history, and emits `channel RuntimeDirective` — window size adjustments, core placement recommendations, clock model pre-assignments — that the runtime applies at the next dispatch boundary.
 
 This is not an AI that controls the OS in an unconstrained way. It is a circuit like any other circuit: declared timing, declared channels, compiler-verified. Its directives are bounded by the compiler's hard floor. It cannot make the system unsafe — the compiler already proved safety. It can only find and exploit slack that the static proof left on the table, because the static proof is conservative by necessity and the AI has the runtime's live data.
 
@@ -969,15 +969,15 @@ Error conditions that originate outside the circuit — hardware faults, resourc
 
 | Condition | Signal | Delivered via |
 |---|---|---|
-| Out of memory | `Channel<RemovalSignal>` | Runtime → circuit |
-| Dependency circuit removed | `Channel<DependencyLost>` | Runtime → subscriber circuits |
-| Budget overrun detected | `Channel<BudgetViolation>` | Observability sub-circuit → declared handler |
-| Hardware fault | `Channel<HardwareFault>` | Driver circuit → subscriber circuits |
-| Handoff staleness exceeded | `Channel<StalenessViolation>` | Runtime → declared handler |
+| Out of memory | `channel RemovalSignal` | Runtime → circuit |
+| Dependency circuit removed | `channel DependencyLost` | Runtime → subscriber circuits |
+| Budget overrun detected | `channel BudgetViolation` | Observability sub-circuit → declared handler |
+| Hardware fault | `channel HardwareFault` | Driver circuit → subscriber circuits |
+| Handoff staleness exceeded | `channel StalenessViolation` | Runtime → declared handler |
 
 Each signal is a typed channel write. The receiving circuit handles it in its next window via its declared exhaustive match — the same mechanism it uses for any other input. There is no separate error-handling path. There is no control-flow transfer outside the circuit's declared windows. The circuit reads the signal, matches it, executes the declared handler, and continues — or acknowledges removal and exits cleanly.
 
-The consequence is that error handling is visible, declared, and compiler-verified in exactly the same way as the happy path. A circuit that subscribes to `Channel<RemovalSignal>` but does not handle it in its match is a compile error. A circuit that handles `DependencyLost` with `ignore` has explicitly declared that it tolerates losing its dependency — and the compiler records that declaration in the manifest. There are no silent failure modes. There are no swallowed exceptions. There are no unhandled panics that terminate the process and leave the system in an unknown state.
+The consequence is that error handling is visible, declared, and compiler-verified in exactly the same way as the happy path. A circuit that subscribes to `channel RemovalSignal` but does not handle it in its match is a compile error. A circuit that handles `DependencyLost` with `ignore` has explicitly declared that it tolerates losing its dependency — and the compiler records that declaration in the manifest. There are no silent failure modes. There are no swallowed exceptions. There are no unhandled panics that terminate the process and leave the system in an unknown state.
 
 A circuit that exceeds its declared budget is not killed. The budget overrun is written to the observability channel. The declared `BudgetViolation` handler runs — which may log the event, reduce the circuit's load, or signal a downstream circuit to shed work. The system adapts through declared channels, not through forced termination.
 
@@ -991,7 +991,7 @@ An exception is an imperative pattern. It is the runtime seizing control from th
 
 ### Microservices Are Circuits with Declared Handoffs
 
-This model scales directly to what is conventionally called a microservice architecture — except without the network, without the serialisation, without the service mesh, without the latency. A microservice is a circuit. Its interface is its declared `Channel<T>` subscriptions. Its deployment is adding it to the live system. Its communication with other services is a memory handoff at a declared tick boundary.
+This model scales directly to what is conventionally called a microservice architecture — except without the network, without the serialisation, without the service mesh, without the latency. A microservice is a circuit. Its interface is its declared `channel T` subscriptions. Its deployment is adding it to the live system. Its communication with other services is a memory handoff at a declared tick boundary.
 
 The handoff tier determines what kind of inter-service communication you get:
 
@@ -1052,7 +1052,7 @@ Compiler derivation table — what the compiler proves from this single annotati
 | Staleness bound | `maxStaleness = "1ms"` | Translates to tick count (e.g. 3,000,000 ticks at 3 GHz). Verifies `TradingEngine`'s write period ≤ that count. Compile error if not. |
 | Coherency gap | `system.cap` cache topology | Reads L3 domain membership for core 1 and core 2. Inserts mandatory gap = cross-L3 coherency latency (e.g. 60–80 ticks) between write window end and read window start. |
 | Core placement | producer + consumer pair | Attempts to place `TradingEngine` and `RiskChecker` on cores sharing an L3 domain. If unavailable, uses next-best topology and recalculates gap. |
-| Staleness logging | `maxStaleness` declared | Emits a `RDTSC` delta instruction at `RiskChecker`'s `riskLimits.get()` call site. Writes delta to `Channel<HandoffLatency>` for the observability sub-circuit. |
+| Staleness logging | `maxStaleness` declared | Emits a `RDTSC` delta instruction at `RiskChecker`'s `riskLimits.get()` call site. Writes delta to `channel HandoffLatency` for the observability sub-circuit. |
 | Anonymity prevention | both sides named | A value annotated `@Handoff` with no matching write in `from` or no matching read in `to` is a compile error. The memory location cannot be unowned. |
 
 `@Handoff` annotations do three things:
@@ -1063,7 +1063,7 @@ Compiler derivation table — what the compiler proves from this single annotati
 
 3. **Enable cross-circuit optimisation** — knowing both producer and consumer, the compiler can place their windows on cores that share a cache domain, reducing coherency latency. Without the annotation, the compiler places windows by availability. With it, the compiler optimises placement specifically for that handoff pair.
 
-`@Handoff` is not required — a `Channel<T>` subscription already declares the connection. `@Handoff` is the programmer's way of asserting stronger properties — named ownership, staleness bounds, placement hints — that the compiler then verifies. It is an annotation that adds proof obligations, not one that relaxes them.
+`@Handoff` is not required — a `channel T` subscription already declares the connection. `@Handoff` is the programmer's way of asserting stronger properties — named ownership, staleness bounds, placement hints — that the compiler then verifies. It is an annotation that adds proof obligations, not one that relaxes them.
 
 ### Cryptographic Circuit Identity
 
@@ -1149,7 +1149,7 @@ The hardware clock is the only synchronisation primitive in the entire system. I
 
 ### The Runtime Resolves Physical Backing — The Programmer Does Not
 
-The programmer writes `Channel<NicFrame>` and calls `in.read()`. There is no DMA in the standard library. There is no `mmap`, no `ioctl`, no driver call, no interrupt registration. The channel is a channel.
+The programmer writes `channel NicFrame` and calls `in.read()`. There is no DMA in the standard library. There is no `mmap`, no `ioctl`, no driver call, no interrupt registration. The channel is a channel.
 
 The physical mechanism that backs it — DMA ring, interrupt delivery, shared ring buffer, inter-core message — is determined entirely by the subscription type in `system.cap`. The compiler reads the subscription declaration, resolves the physical backing for that channel name, and emits the correct access pattern. The programmer never wrote hardware code. The hardware was never invisible — it was declared once, in the configuration, and the compiler applied it everywhere.
 
@@ -1184,13 +1184,13 @@ The compiler resolves from the `Device.SPI0` descriptor: the DREQ line number, t
 
 ### The Runtime Is the Type Enforcer
 
-Hardware-incorrect code does not compile. Not because a linter ran after the fact. Because the type system encodes the hardware model: `Channel<T>` is typed, so reading the wrong type is a type error. Subscription lists are compile-time verified, so reading an undeclared channel is a compile error. Cycle budgets are verified by the proc-macro against `llvm-mca`, so exceeding the budget is a compile error. The type system is the hardware contract. The compiler is the enforcer. The runtime confirms what the compiler already proved.
+Hardware-incorrect code does not compile. Not because a linter ran after the fact. Because the type system encodes the hardware model: `channel T` is typed, so reading the wrong type is a type error. Subscription lists are compile-time verified, so reading an undeclared channel is a compile error. Cycle budgets are verified by the proc-macro against `llvm-mca`, so exceeding the budget is a compile error. The type system is the hardware contract. The compiler is the enforcer. The runtime confirms what the compiler already proved.
 
 ### Generation 1 to Generation 2 — Closing the Loop
 
 Generation 1 ships a working system: the language, the compiler, the runtime, the kernel circuits — all written in the language — plus ~500 lines of Assembly stubs for boot and hardware initialisation. The Assembly is not hidden; it is the declared boundary between what the language can express and what requires raw instruction sequences.
 
-Generation 2 erases that boundary. The compiler, now running on Generation 1, rewrites the Assembly stubs as declared `Channel<T>` functions. The boot sequence becomes a declared function with a declared timing contract. Hardware initialisation becomes a sequence of channel writes. The ~500 lines of Assembly become zero. The system is fully expressed in the language that proved hardware-correctness of everything else.
+Generation 2 erases that boundary. The compiler, now running on Generation 1, rewrites the Assembly stubs as declared `channel T` functions. The boot sequence becomes a declared function with a declared timing contract. Hardware initialisation becomes a sequence of channel writes. The ~500 lines of Assembly become zero. The system is fully expressed in the language that proved hardware-correctness of everything else.
 
 A language that can express the kernel can express its own compiler. A compiler that can prove hardware-correctness of timed functions can prove hardware-correctness of itself. The compiler and the kernel become the same artefact: a collection of declared-timing functions, verified and self-validating.
 
@@ -1263,7 +1263,7 @@ In the clock-aware model, that gap can be closed by the machine itself. The prog
 
   CIRCUIT SYNTHESIS
   ─────────────────────────────────────────────────────────
-  NicCircuit → Channel<EthernetFrame> → PacketProcessor → ...
+  NicCircuit → channel EthernetFrame → PacketProcessor → ...
   (topology, channel types, handoff tiers — AI-generated)
 
          │
@@ -1355,7 +1355,7 @@ A five-layer stack with two layers being the same thing has fewer interactions b
 
 ## Relation to the ADRs
 
-The ADRs in this repository record implementation decisions for a near-term Rust prototype: proc-macro annotations, `system.cap`, `Channel<T>`, `cargo-timeslice`. That prototype is a research vehicle — a way to validate the scheduling model, the channel model, and the verification approach on existing hardware using existing toolchain infrastructure. It is not the OS described in this paper.
+The ADRs in this repository record implementation decisions for a near-term Rust prototype: proc-macro annotations, `system.cap`, `channel T`, `cargo-timeslice`. That prototype is a research vehicle — a way to validate the scheduling model, the channel model, and the verification approach on existing hardware using existing toolchain infrastructure. It is not the OS described in this paper.
 
 The channel-based I/O model (ADR-0010) is the first instantiation of the unified I/O abstraction. The unified system configuration (ADR-0005) is the first instantiation of the hardware-model declaration. The CPU partition model (ADR-0002) is the first instantiation of the static dispatch table. These concepts carry forward directly into the runtime.
 

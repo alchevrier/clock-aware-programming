@@ -339,9 +339,9 @@ The consequence is that inference throughput per mm² increases not because the 
 
 ### Channel Is Broadcast — One Signal to All Subscribed Devices
 
-A `Channel<T>` write in the clock-aware model is not a point-to-point message. It is a **broadcast**: a single write to the channel simultaneously delivers the value to every circuit subscribed to that channel — including circuits on other cores, circuits backed by different memory tiers, and circuits that are hardware peripherals rather than software circuits.
+A `channel T` write in the clock-aware model is not a point-to-point message. It is a **broadcast**: a single write to the channel simultaneously delivers the value to every circuit subscribed to that channel — including circuits on other cores, circuits backed by different memory tiers, and circuits that are hardware peripherals rather than software circuits.
 
-This means a `Channel<SensorReading>` produced by a sensor driver is received in the same tick by every circuit that declared a subscription to it — a display circuit, a logging circuit, an ML inference circuit, a control loop circuit — without the producer knowing or caring how many consumers exist. The compiler resolves the subscriber list from `system.cap` at build time and emits the correct fanout pattern for the physical topology (shared cache line, inter-core message, DMA ring).
+This means a `channel SensorReading` produced by a sensor driver is received in the same tick by every circuit that declared a subscription to it — a display circuit, a logging circuit, an ML inference circuit, a control loop circuit — without the producer knowing or caring how many consumers exist. The compiler resolves the subscriber list from `system.cap` at build time and emits the correct fanout pattern for the physical topology (shared cache line, inter-core message, DMA ring).
 
 From the programmer's perspective, a channel write is one operation. From the hardware's perspective, it is a single cache line write that the cache coherency mesh fans out to all declared subscribers simultaneously. The broadcast is structural — not a runtime pub/sub dispatch, not an event bus, not a message broker. One write. All subscribers. Declared at compile time. Zero runtime overhead.
 
@@ -359,11 +359,11 @@ The distinction matters for correctness. A `Permanent` tier access (DRAM, pinned
 
 The clock-aware model can prove when a hardware device is not meeting its declared specification. Every device in `system.cap` declares its timing characteristics — the CPU's execution unit latencies, the DRAM's row activation time, the NVMe's read latency distribution. The trace unit continuously measures actual device behaviour against these declarations.
 
-When the measured latency of a precise resource deviates from its declared value, the `ObservabilityCircuit` emits a `Channel<DeviceViolation>` signal: the device, the declared latency, the measured latency, and the tick at which the deviation occurred. This is not a performance alert. It is a correctness proof failure — the hardware is not behaving as the compiler assumed.
+When the measured latency of a precise resource deviates from its declared value, the `ObservabilityCircuit` emits a `channel DeviceViolation` signal: the device, the declared latency, the measured latency, and the tick at which the deviation occurred. This is not a performance alert. It is a correctness proof failure — the hardware is not behaving as the compiler assumed.
 
 The uses of this are precise:
 
-1. **Manufacturing defects.** A CPU core that consistently delivers 10% more latency than its speed grade declares is a binning error. The trace proves it. The runtime can migrate circuits away from that core automatically, via `Channel<CoreEviction>`, and flag the device for replacement.
+1. **Manufacturing defects.** A CPU core that consistently delivers 10% more latency than its speed grade declares is a binning error. The trace proves it. The runtime can migrate circuits away from that core automatically, via `channel CoreEviction`, and flag the device for replacement.
 
 2. **Thermal degradation.** A device that meets spec at cold but drifts under sustained load has its drift characterised by the atom stream over time. The compiler can be re-fed the measured latencies as a new `system.cap` entry — the calibrated model — and recompile against the device's actual behaviour rather than its nominal spec.
 

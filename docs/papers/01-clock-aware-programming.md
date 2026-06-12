@@ -40,7 +40,7 @@ CPUs are not deterministic — but only because we never tell them to be. Under 
 | Working set declared and pinned in L1 (< 32 KB) | `mlock`, huge pages, prefetch annotations |
 | Dedicated isolated core | `isolcpus`, `nohz_full`, `irqaffinity`, `rcu_nocbs` |
 | Branch-free hot path | Compiler intrinsics, profile-guided branch elimination |
-| Channel-based I/O | Every hardware signal is `Channel<T>`; declared write rate, declared read cycle, no interrupt delivery to app cores |
+| Channel-based I/O | Every hardware signal is `channel T`; declared write rate, declared read cycle, no interrupt delivery to app cores |
 
 Under these preconditions: **cycle count is a pure function of instruction mix × CPU microarchitecture model — computable at compile time.**
 
@@ -54,11 +54,11 @@ That makes the clock a first-class compiler concept. A program that declares its
 
 2. **Lock-free by construction** — Locks exist because of temporal uncertainty. Remove the uncertainty and ordering is guaranteed by schedule, not runtime serialisation. A compiler that knows core 2 reads at cycle N and core 0 writes at cycle N+K where K > read latency has proved the ordering. No lock needed.
 
-3. **FSM execution model** — The app partition is a finite state machine: declared states, deterministic transitions, no preemption. The OS partition is not a black box — it is a collection of declared-timing circuits (IRQ handlers, RCU reclaim, memory management), each writing into typed `Channel<T>` conduits that the app partition reads at declared cycles. This is exactly the PS/PL split on a Zynq — except both sides are clock-aware, not just the PL fabric.
+3. **FSM execution model** — The app partition is a finite state machine: declared states, deterministic transitions, no preemption. The OS partition is not a black box — it is a collection of declared-timing circuits (IRQ handlers, RCU reclaim, memory management), each writing into typed `channel T` conduits that the app partition reads at declared cycles. This is exactly the PS/PL split on a Zynq — except both sides are clock-aware, not just the PL fabric.
 
 4. **Unified system configuration** — Today, isolating a core requires `isolcpus=2-7 nohz_full=2-7 irqaffinity=0,1 rcu_nocbs=2-7` scattered across boot parameters, systemd unit files, and NUMA policy scripts. One declarative config file replaces all of it and scopes the compiler's verification domain.
 
-5. **Channel-based I/O eliminates the network stack** — Eliminates the `hardirq → softirq → sk_buff → socket` chain. The NIC is `Channel<NicFrame>`: hardware DMA writes frames directly into the declared channel buffer; the circuit reads at its declared cycle. There is no poll loop, no interrupt, no scheduler involvement — the distinction between interrupt, poll, and message dissolves when receive timing is declared. The circuit's channel depth drives its own cycle budget: deep channel → run sooner; empty channel → run later. No kernel involvement on the hot path. Latency bound is a compile-time theorem, not a runtime measurement.
+5. **Channel-based I/O eliminates the network stack** — Eliminates the `hardirq → softirq → sk_buff → socket` chain. The NIC is `channel NicFrame`: hardware DMA writes frames directly into the declared channel buffer; the circuit reads at its declared cycle. There is no poll loop, no interrupt, no scheduler involvement — the distinction between interrupt, poll, and message dissolves when receive timing is declared. The circuit's channel depth drives its own cycle budget: deep channel → run sooner; empty channel → run later. No kernel involvement on the hot path. Latency bound is a compile-time theorem, not a runtime measurement.
 
 6. **The scheduler becomes unnecessary** — The scheduler exists because the OS does not know when tasks will complete; it arbitrates contention between them by preemption. But the scheduler can only arbitrate *contention* — and contention only exists between circuits that share time without declaring it. Under clock-aware programming, every circuit in the kernel is independent and self-regulating by declared clock cycles: each occupies non-overlapping cycle windows, self-regulates on load within its own declared budget, and does not compete with any other circuit for CPU time because competition requires temporal ambiguity. Independent circuits with declared, non-overlapping windows have no contention to arbitrate. This applies not just to user processes but to the kernel itself: softirqs, RCU callbacks, kthreads, and workqueues are all scheduled because their timing is unknown and they implicitly contend. Make every circuit's timing explicit and the contention dissolves by construction — not because the scheduler became smarter, but because the condition that required arbitration no longer exists. The scheduler is not replaced by a better scheduler; it is replaced by the absence of the condition that made one necessary.
 
@@ -100,7 +100,7 @@ The partition model is the extreme end of the spectrum — the configuration for
 
 Both partitions are **cycle-compliant collections of self-regulating circuits** — there is no scheduler in either. A scheduler arbitrates contention; contention only exists between circuits whose timing is unknown. When every circuit declares its cycle window, there is no contention to arbitrate and therefore nothing to schedule. The OS partition is not "Linux with an annotated scheduler" — it is a set of independent kernel circuits (IRQ receivers, RCU reclaim, memory management, management plane), each self-regulating on declared timing and each dynamically parametrisable at cycle boundaries. They do not contend because their windows are declared non-overlapping. No arbitrator exists; none is needed.
 
-Crucially, **every hardware signal is a channel write in this model** — there are no special cases. A hardware interrupt does not preempt a running circuit; it deposits a signal into a `Channel<IrqSignal>`. A NIC frame does not trigger a poll-mode read loop; it arrives into a `Channel<NicFrame>`. The shared ring buffer between partitions is a `Channel<OsEvent>`. Every signal source — hardware interrupt, NIC, inter-partition boundary, timer — uses the same abstraction: a typed channel with a declared write cycle, consumed by the receiver at its next declared read cycle. No context switch. No handler invoked out of band. No polling distinction. The distinction between "interrupt", "poll", and "message" dissolves — because all three distinctions existed only because the timing of hardware signals was never declared. Declared timing collapses them into one thing: a channel.
+Crucially, **every hardware signal is a channel write in this model** — there are no special cases. A hardware interrupt does not preempt a running circuit; it deposits a signal into a `channel IrqSignal`. A NIC frame does not trigger a poll-mode read loop; it arrives into a `channel NicFrame`. The shared ring buffer between partitions is a `channel OsEvent`. Every signal source — hardware interrupt, NIC, inter-partition boundary, timer — uses the same abstraction: a typed channel with a declared write cycle, consumed by the receiver at its next declared read cycle. No context switch. No handler invoked out of band. No polling distinction. The distinction between "interrupt", "poll", and "message" dissolves — because all three distinctions existed only because the timing of hardware signals was never declared. Declared timing collapses them into one thing: a channel.
 
 The physical boundary is enforced by kernel configuration: IRQs are directed to OS cores (`irqaffinity`), the scheduler tick is suppressed on app cores (`nohz_full`), RCU quiescent-state tracking is confined to OS cores (`rcu_nocbs`), and app cores are removed from the load balancer (`isolcpus`). These mechanisms enforce the boundary at runtime; the clock-aware annotations enforce correctness at compile time.
 
@@ -111,7 +111,7 @@ The physical boundary is enforced by kernel configuration: IRQs are directed to 
 │  OS Partition (cores 0–1)          App Partition (cores 2–7)     │
 │  ┌──────────────────────────┐      ┌──────────────────────────┐  │
 │  │ #[timeslice] IRQ circuit │      │ #[timeslice] FSM circuit  │  │
-│  │   ← Channel<IrqSignal>  │      │   ← Channel<NicFrame>     │  │
+│  │   ← channel IrqSignal  │      │   ← channel NicFrame     │  │
 │  │ #[timeslice] RCU reclaim │      │ L1-pinned working set     │  │
 │  │ #[timeslice] mem mgmt    │      │ No OS intervention        │  │
 │  │ #[timeslice] mgmt plane  │      │  (no scheduler)           │  │
@@ -134,7 +134,7 @@ Boundary enforced by: isolcpus, nohz_full, irqaffinity, rcu_nocbs
 
 ## Application Identity and Channel Subscriptions
 
-When every signal in the system is a `Channel<T>`, application access control falls out of the channel model for free. An application is not a process with a UID and a set of capabilities checked at runtime — it is a named circuit with a declared subscription list, verified at compile time.
+When every signal in the system is a `channel T`, application access control falls out of the channel model for free. An application is not a process with a UID and a set of capabilities checked at runtime — it is a named circuit with a declared subscription list, verified at compile time.
 
 In `system.cap`:
 
@@ -152,7 +152,7 @@ The application declares:
 - **What it writes** (`publishes`) — the only channels its code is permitted to write.
 - **Where and when** (`core`, `budget_ns`) — its timing contract.
 
-The proc-macro checker reads the subscription list at compile time and verifies that every `Channel<T>::read()` call in the application's code refers to a declared-subscription channel, and every `Channel<T>::write()` call refers to a declared-publish channel. A read from an undeclared channel is a compile error — not an access denied at runtime, not a kernel permission check, not a capability lookup. The binary that is produced physically cannot read data it was not declared to read, because the compiler rejected the code that would have done so.
+The proc-macro checker reads the subscription list at compile time and verifies that every `channel T::read()` call in the application's code refers to a declared-subscription channel, and every `channel T::write()` call refers to a declared-publish channel. A read from an undeclared channel is a compile error — not an access denied at runtime, not a kernel permission check, not a capability lookup. The binary that is produced physically cannot read data it was not declared to read, because the compiler rejected the code that would have done so.
 
 **This is capability-based security without a capability runtime.** Traditional capability systems (seL4, CHERI, Linux capabilities) enforce access control at runtime: the kernel checks whether the calling process holds the capability before permitting the operation. The check has a cost, the capability table has a size, and a compromised process with valid capabilities is indistinguishable from a correct one. Here the enforcement is structural: the application's source code declares its access boundaries, the compiler proves every access is within those boundaries, and the resulting binary contains no instructions that could reach an undeclared channel — because no such instructions were emitted. There is nothing to check at runtime because the invariant is a property of the binary, not a runtime predicate.
 

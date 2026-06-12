@@ -22,7 +22,7 @@ The language comes first. Not Rust with annotations bolted on. Not an existing l
 The implementation path follows two generations:
 
 - **Generation 1** — the language is written and the compiler targets the language itself. The unavoidable hardware boundary — system calls, boot, hardware initialisation — is covered by a thin layer of Assembly stubs (~500 lines). Everything above the stubs is written in the language.
-- **Generation 2** — the compiler rewrites those Assembly stubs in the language itself, using `channel<T>` declarations to express what the stubs previously expressed in raw instruction sequences. The language becomes fully self-hosting. No assembly. No Rust. No foreign layer.
+- **Generation 2** — the compiler rewrites those Assembly stubs in the language itself, using `channel T` declarations to express what the stubs previously expressed in raw instruction sequences. The language becomes fully self-hosting. No assembly. No Rust. No foreign layer.
 
 The stubs in Generation 1 are not a concession — they are the hardware boundary that cannot be abstracted away without first having a language capable of expressing it. Generation 2 is when the language proves it can.
 
@@ -69,19 +69,19 @@ Lifetime types are the second rule. They are type keywords — the same way `int
 
 `cold` is the tier no managed language can express. Java, Go, Python have no concept of "load this at a declared cycle from storage." In the clock-aware model, a `cold` access is declared, its load cycle is verified against the NVMe latency in `system.cap`, and the compiler rejects declarations whose timing budget is insufficient. Storage latency becomes a compile-time constraint, not a runtime surprise.
 
-**The compiler guarantees L1 utilisation.** `system.cap` declares the L1 cache capacity of the target core. The compiler sums the declared footprints of every `Ephemeral` and `Task` value in a circuit's active window — every collection size, every channel buffer, every intermediate value. If the total exceeds the L1 capacity declared for the assigned core, the compiler rejects the programme with a precise error: which values, how many bytes each, and by how much the L1 is exceeded. If it fits, the compiler emits a proof that the circuit's hot path working set is entirely resident in L1 for the duration of its window — no evictions, no reloads, no cache misses. This proof is part of the manifest. The trace unit validates it at runtime: a cache miss on the hot path of a circuit with a passing L1 proof is a `channel<ExecutionPlanViolation>` signal, flagging either a hardware anomaly or a compiler model mismatch against `system.cap`.
+**The compiler guarantees L1 utilisation.** `system.cap` declares the L1 cache capacity of the target core. The compiler sums the declared footprints of every `Ephemeral` and `Task` value in a circuit's active window — every collection size, every channel buffer, every intermediate value. If the total exceeds the L1 capacity declared for the assigned core, the compiler rejects the programme with a precise error: which values, how many bytes each, and by how much the L1 is exceeded. If it fits, the compiler emits a proof that the circuit's hot path working set is entirely resident in L1 for the duration of its window — no evictions, no reloads, no cache misses. This proof is part of the manifest. The trace unit validates it at runtime: a cache miss on the hot path of a circuit with a passing L1 proof is a `channel ExecutionPlanViolation` signal, flagging either a hardware anomaly or a compiler model mismatch against `system.cap`.
 
 The guarantee is not "probably L1-resident" or "L1-resident under normal conditions". It is unconditional: the working set fits by construction, and any deviation is immediately observable and attributed.
 
 The runtime extends this statically: it tracks L1 utilisation live via the atom stream. Each atom carries the actual cache line occupancy of the circuit that just executed. The `ObservabilityCircuit` aggregates this into a per-core L1 pressure map updated every tick. When a core's L1 pressure consistently falls below a threshold — because circuits are finishing with significant working-set slack — the runtime has two responses:
 
-1. **Adjust the execution plan.** The runtime signals the `AdaptationCircuit` via `channel<L1Advisory>`. The adaptation circuit can recommend promoting a `Session`-tier value to `Ephemeral` for that core — pre-loading it into L1 ahead of the next window that needs it — reducing effective access latency without the programmer declaring it. The compiler's static proof is the floor; the runtime's promotion is a safe tightening within it.
+1. **Adjust the execution plan.** The runtime signals the `AdaptationCircuit` via `channel L1Advisory`. The adaptation circuit can recommend promoting a `Session`-tier value to `Ephemeral` for that core — pre-loading it into L1 ahead of the next window that needs it — reducing effective access latency without the programmer declaring it. The compiler's static proof is the floor; the runtime's promotion is a safe tightening within it.
 
 2. **Switch `clock_model`.** A core whose L1 is consistently underutilised is a core whose circuits are consistently finishing early. The runtime can downgrade its `clock_model` from `Performance` to `Balanced` — reducing frequency and power — with the proof that the circuits' declared windows still close in time at the lower frequency. The switch is not a guess. It is derived from the L1 utilisation data and the compiler's known instruction count for each circuit on that core.
 
 Both of these are *reactive* responses. The runtime has a third, more powerful capability: **speculative clock model pre-adjustment**. Because the dispatch table is known in full for the next N ticks — it is a compile-time theorem — the runtime can look ahead and pre-transition a core's `clock_model` before a burst arrives, not in response to it.
 
-The concrete case is a DMA burst from the NIC. The runtime knows from the dispatch table that in 8 ticks, the `NicCircuit` will deliver a `channel<EthernetFrame>` burst and the `PacketProcessor` circuit will begin executing on core 3. Core 3 is currently in `Efficiency` mode. The runtime pre-transitions core 3 to `Performance` at tick N−2 — two ticks before the burst window opens — so the core is at full frequency and full pipeline depth when the first frame arrives. The `PacketProcessor` never executes a single cycle at reduced frequency. The transition cost is paid in advance, in a gap the dispatch table already has scheduled.
+The concrete case is a DMA burst from the NIC. The runtime knows from the dispatch table that in 8 ticks, the `NicCircuit` will deliver a `channel EthernetFrame` burst and the `PacketProcessor` circuit will begin executing on core 3. Core 3 is currently in `Efficiency` mode. The runtime pre-transitions core 3 to `Performance` at tick N−2 — two ticks before the burst window opens — so the core is at full frequency and full pipeline depth when the first frame arrives. The `PacketProcessor` never executes a single cycle at reduced frequency. The transition cost is paid in advance, in a gap the dispatch table already has scheduled.
 
 ```
   tick N-8  NicCircuit declares frame burst incoming
@@ -93,13 +93,13 @@ The concrete case is a DMA burst from the NIC. The runtime knows from the dispat
 
 This is the general pattern: the dispatch table is the lookahead. Every future burst, every future handoff, every future DMA completion is visible in it. The runtime uses this knowledge to pre-condition hardware state — clock frequency, L1 pre-population, core affinity migration — so that when the window opens, the hardware is already in the correct state. There is no warmup cost. There is no reactive lag. The preparation is as provable as the execution.
 
-The reason this works — and the reason it is not speculation in the conventional sense — is that the runtime knows from the manifest exactly which circuit subscribes to which channel. The channel subscription graph is a compile-time fact, not a runtime discovery. When the `NicCircuit` declares it produces to `channel<EthernetFrame>` and the `PacketProcessor` declares it subscribes to that channel, the runtime has a complete causal map: NIC DMA completion → frame on channel → `PacketProcessor` window opens. Every hop in that chain is declared. None of it is inferred at runtime. The runtime is not predicting what will happen — it is reading a theorem that the compiler already proved. Pre-conditioning the hardware for that chain is executing a known consequence, not betting on an uncertain future.
+The reason this works — and the reason it is not speculation in the conventional sense — is that the runtime knows from the manifest exactly which circuit subscribes to which channel. The channel subscription graph is a compile-time fact, not a runtime discovery. When the `NicCircuit` declares it produces to `channel EthernetFrame` and the `PacketProcessor` declares it subscribes to that channel, the runtime has a complete causal map: NIC DMA completion → frame on channel → `PacketProcessor` window opens. Every hop in that chain is declared. None of it is inferred at runtime. The runtime is not predicting what will happen — it is reading a theorem that the compiler already proved. Pre-conditioning the hardware for that chain is executing a known consequence, not betting on an uncertain future.
 
 A conventional OS has no equivalent knowledge. It sees a file descriptor — an integer. File descriptor 7 might be a TCP connection, a pipe, a regular file, or a Unix socket. The OS does not know. The application knows, but it never told the OS. The result is that the OS cannot pre-condition anything: it reacts to a `read()` syscall, discovers at that moment what fd 7 is connected to, hands off to the right driver, and waits. The hardware was idle during the discovery. The core was at whatever frequency it happened to be at. The cache contained whatever happened to be there. Every step is reactive because the information was never declared.
 
 This is the deepest sense in which the clock-aware model is **self-aware**: the runtime knows who uses what, exactly as an electronic circuit knows its routing. In an electronic circuit you do not put a signal into a wire and hope the right component picks it up. You design a routing table — traces, buses, demultiplexers — that is fixed at PCB design time. The signal reaches exactly the right component in exactly the right number of nanoseconds because the path was declared before the board was etched. The efficiency is structural, not emergent.
 
-The clock-aware model applies this to software. `channel<EthernetFrame>` is a trace on the PCB. The `NicCircuit` is the component that drives it. The `PacketProcessor` is the component that receives it. The routing table is the channel subscription graph in the manifest. The compiler is the PCB designer. The runtime is the board running — no routing decisions at runtime, because the routing was declared at design time. That is why it is efficient. That is why it is provable. That is why a conventional OS, which makes routing decisions at runtime from file descriptors it does not understand, can never achieve the same guarantees.
+The clock-aware model applies this to software. `channel EthernetFrame` is a trace on the PCB. The `NicCircuit` is the component that drives it. The `PacketProcessor` is the component that receives it. The routing table is the channel subscription graph in the manifest. The compiler is the PCB designer. The runtime is the board running — no routing decisions at runtime, because the routing was declared at design time. That is why it is efficient. That is why it is provable. That is why a conventional OS, which makes routing decisions at runtime from file descriptors it does not understand, can never achieve the same guarantees.
 
 The reason conventional systems cannot do this is not a missing feature — it is a structural disconnection. A DMA device always knew everything it needed to say: when it would have data ready, how much, at what rate, on what bus. The NIC knows it is about to deliver 64 Ethernet frames. The DMA controller knows the source address, the destination, the transfer size. The DREQ signal knows when the peripheral is ready. All of that information existed at hardware design time. And the application programmer always knew what circuit would consume the data: the packet processor, the parser, the inference engine. That too was known at design time.
 
@@ -129,7 +129,7 @@ A `fn` is combinational logic — the gate, not the flip-flop. Its output is a s
 
 ```
 @Timeslice(core = 2, cycle = "4ns")
-fn parsePrice(in: channel<RawMessage>): channel<Price> =
+fn parsePrice(in: channel RawMessage): channel Price =
     channel.of(extract(in.get(consumerIndex)))
 ```
 
@@ -137,7 +137,7 @@ Composition is plain function application — exactly as in circuit diagrams whe
 
 ```
 @Timeslice(core = 2, cycle = "4ns")
-fn pipeline(raw: channel<RawMessage>): channel<BookSnapshot> =
+fn pipeline(raw: channel RawMessage): channel BookSnapshot =
     updateBook(parsePrice(raw))   // raw → prices → book
 ```
 
@@ -213,7 +213,7 @@ The type system detects this structurally. A path that uses a `cold<T>` type is 
 
 ```
 @Timeslice(core = 2, cycle = "4ns")
-fn parsePrice(in: channel<RawMessage>): channel<Price> {
+fn parsePrice(in: channel RawMessage): channel Price {
     val raw = in.get(consumerIndex);
 
     return switch (raw.status) {
@@ -230,9 +230,9 @@ Circuit equivalent:
                          ┌──────────────────────────────────────────────────┐
                          │  parsePrice — @Timeslice(cycle = 4ns)            │
                          │                                                  │
-  channel<RawMessage> ──►│ in.get()    ┌────────────┐                      │
+  channel RawMessage ──►│ in.get()    ┌────────────┐                      │
   (input port)           │             │   switch   │ Ok                   │
-                         │             │  raw.status├──────► extract() ───►│──► channel<Price>
+                         │             │  raw.status├──────► extract() ───►│──► channel Price
                          │             │            │        (hot path)    │    (output signal)
                          │             │            │        ← 4ns budget →│
                          │             │            │                      │
@@ -336,9 +336,9 @@ collection.get(key)          // resolves slot via readAccessPattern(key), return
 
 No `push`. No `pop`. No `enqueue`. No `dequeue`. No `peek`. Every data structure in the language, regardless of its access discipline, exposes the same two-operation interface. The discipline — FIFO, LIFO, ring, table — is encoded in what key the caller passes, not in the API. `put` and `get` are the only verbs the programmer needs to know.
 
-This is the deeper unification: `channel<T>` itself is a collection with a declared access pattern. The channel model does not sit above the collection model — it is an instance of it. A `channel<T>` is simply a collection whose `writeAccessPattern` and `readAccessPattern` happen to be the ring-buffer masking arithmetic, and whose keys — the producer and consumer indices — are managed by the runtime at the cycle boundary.
+This is the deeper unification: `channel T` itself is a collection with a declared access pattern. The channel model does not sit above the collection model — it is an instance of it. A `channel T` is simply a collection whose `writeAccessPattern` and `readAccessPattern` happen to be the ring-buffer masking arithmetic, and whose keys — the producer and consumer indices — are managed by the runtime at the cycle boundary.
 
-Every inter-function data path in the system, whether called a channel, a ring buffer, a queue, a stack, or a lookup table, is the same thing: a declared size and a pair of declared access patterns, accessed via `put` and `get`. The word "channel" is not a special construct — it is a named convention for a collection whose access pattern encodes ordered delivery. If the programmer wanted, they could declare it themselves. The stdlib `channel<T>` is provided as a convenience, not as a primitive.
+Every inter-function data path in the system, whether called a channel, a ring buffer, a queue, a stack, or a lookup table, is the same thing: a declared size and a pair of declared access patterns, accessed via `put` and `get`. The word "channel" is not a special construct — it is a named convention for a collection whose access pattern encodes ordered delivery. If the programmer wanted, they could declare it themselves. The stdlib `channel T` is provided as a convenience, not as a primitive.
 
 The compiler sees one construct. The hardware sees one thing: a stride into a contiguous array.
 
@@ -377,10 +377,10 @@ A `circuit` is a stateful clocked block. Its state is declared as internal `chan
 ```
 @Timeslice(core = 2, cycle = "4ns")
 circuit OrderBook {
-    channel<PriceTable> bids: memory    // internal channel — self-feeding state across clock boundaries
-    channel<PriceTable> asks: memory
+    channel PriceTable bids: memory    // internal channel — self-feeding state across clock boundaries
+    channel PriceTable asks: memory
 
-    fn update(in: channel<Fill>): channel<BookSnapshot> =
+    fn update(in: channel Fill): channel BookSnapshot =
         snapshot(apply(in.get(consumerIndex), bids, asks))   // ALU: read state, transform, emit signal
 
     fn bestBid(): Price = bids.get(topKey)   // combinational read — output pin
@@ -394,17 +394,17 @@ Circuit equivalent:
                     │                   OrderBook                          │
                     │               @Timeslice(cycle = 4ns)                │
                     │                                                      │
-  channel<Fill> ───►│ update()    ┌──────────┐                            │
+  channel Fill ───►│ update()    ┌──────────┐                            │
   (input port)      │             │   ALU    │                            │
-                    │    ┌───────►│ apply()  ├────────────────────────── ►│──► channel<BookSnapshot>
+                    │    ┌───────►│ apply()  ├────────────────────────── ►│──► channel BookSnapshot
                     │    │        │ snapshot()│                            │    (output signal)
                     │    │        └────┬─────┘                            │
                     │    │             │ write-back                        │
                     │    │             ▼                                   │
                     │  ┌─┴────────────────────────────┐                   │
                     │  │   Internal channels (memory)  │                   │
-                    │  │  channel<PriceTable> bids ◄───┘  (self-feeding)  │
-                    │  │  channel<PriceTable> asks ◄──────────────────    │
+                    │  │  channel PriceTable bids ◄───┘  (self-feeding)  │
+                    │  │  channel PriceTable asks ◄──────────────────    │
                     │  └──────────────────────────────┘                   │
                     │                 │ (loop back into next clock cycle)  │
                     │                 ▼                                    │
@@ -419,9 +419,9 @@ A `circuit` may also **return an internal channel** as its output signal — the
 
 ```
 circuit BestBidTracker {
-    channel<Price> best: memory   // self-feeding AND returned as output
+    channel Price best: memory   // self-feeding AND returned as output
 
-    fn track(in: channel<Fill>): channel<Price> {
+    fn track(in: channel Fill): channel Price {
         val candidate = in.get(consumerIndex).price
         best = if candidate < best.get() { channel.of(candidate) } else { best }
         return best
@@ -452,7 +452,7 @@ A `circuit` is a clocked block with self-feeding channels. A `fn` is combination
 
 ### No Unsafe Escape Hatch
 
-The absence of `unsafe` is the strongest claim. In Rust, `unsafe` exists because the language model cannot express all valid programs without it: hardware access, FFI, pointer arithmetic. In the clock-aware language, all hardware access is through `channel<T>`. There is no raw pointer because there is no need for one — the channel model covers every hardware interaction, and the compiler knows the full channel graph from `system.cap`. There is nothing that `unsafe` would permit that the type system cannot already express.
+The absence of `unsafe` is the strongest claim. In Rust, `unsafe` exists because the language model cannot express all valid programs without it: hardware access, FFI, pointer arithmetic. In the clock-aware language, all hardware access is through `channel T`. There is no raw pointer because there is no need for one — the channel model covers every hardware interaction, and the compiler knows the full channel graph from `system.cap`. There is nothing that `unsafe` would permit that the type system cannot already express.
 
 A program that cannot be expressed without `unsafe` is a program that has not declared its timing. The solution is to declare it, not to escape the model.
 
@@ -473,7 +473,7 @@ A program that cannot be expressed without `unsafe` is a program that has not de
 | Implicit barriers | Pipeline stalls from barrier instructions are structural overhead |
 | GC pauses | Unpredictable stop-the-world violates every real-time contract |
 
-Each of these is not prohibited by a style guide or a linter. It is prohibited by the type system: `channel<T>` transfers ownership without copying; lifetime types eliminate heap allocation on the hot path; array-based collections make pointer chasing inexpressible; cycle annotations make timing explicit; the absence of shared mutable state makes barriers impossible to need; the two-question memory manager makes GC pauses structurally impossible.
+Each of these is not prohibited by a style guide or a linter. It is prohibited by the type system: `channel T` transfers ownership without copying; lifetime types eliminate heap allocation on the hot path; array-based collections make pointer chasing inexpressible; cycle annotations make timing explicit; the absence of shared mutable state makes barriers impossible to need; the two-question memory manager makes GC pauses structurally impossible.
 
 If it compiles, the hardware-correctness is not assumed. It is a theorem.
 
@@ -494,7 +494,7 @@ Why the clock-aware language is different:
 | 4 language rules | Fits in any context window; AI holds the complete model |
 | Declared timing | AI can verify cycle budget correctness before generating |
 | Lifetime types | AI knows exactly where each value lives and when it expires |
-| `channel<T>` | AI knows the complete I/O pattern from the subscription list |
+| `channel T` | AI knows the complete I/O pattern from the subscription list |
 | Exhaustive match | AI cannot silently omit a state; every unhandled case must be explicitly declared as ignored or defaulted — the compiler rejects undeclared intent |
 | Hardware-correct by type | AI's output is compiler-validated, not human-validated |
 
