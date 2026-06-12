@@ -795,28 +795,39 @@ circuit ParsePrice {
 }
 ```
 
-That is the entire benchmark declaration. No benchmark harness. No warmup loop. No separate profiling binary. No external tooling. The annotation tells the compiler two things:
+That is the entire benchmark declaration. No benchmark harness. No warmup loop. No separate profiling binary. No external tooling. No library to link. No import statement. The annotation tells the compiler two things:
 
 1. **Name this measurement** — the string `"parsePrice"` becomes the key in the `ObservabilityCircuit`'s measurement registry.
 2. **Generate a percentile channel** — the compiler produces `channel ParsePriceMeasurement` automatically, backed in the `session` tier. The `ObservabilityCircuit` writes to it at its declared low-frequency window.
 
-The generated channel element contains the full distribution:
+The generated channel holds the full raw sample set — every `CLKIN` tick delta from every execution, in the order they occurred:
 
 ```
 channel ParsePriceMeasurement {
-    val element = Measurement   // { p50, p90, p99, p999, p9999, max, min, count }
-    val tier    = session
+    val element = Tick          // one CLKIN tick delta per execution, as recorded
+    val tier    = permanent     // accumulated for the programme lifetime
+    val size    = 16_777_216    // declared capacity — 16M samples at 8 bytes = 128 MB
 }
 ```
 
-Reading percentiles requires no scaffolding:
+Reading is reading:
 
 ```
-val m = ParsePriceMeasurement.get()
-// m.p99   — 99th-percentile execution time in CLKIN ticks
-// m.p9999 — 99.99th-percentile
-// m.count — executions accumulated in this distribution window
+val samples = ParsePriceMeasurement.get()
 ```
+
+Computing a percentile is calling a function on the samples:
+
+```
+val p99   = percentile(samples, 99.0)
+val p9999 = percentile(samples, 99.99)
+val p50   = percentile(samples, 50.0)
+val tail  = percentile(samples, 99.999)   // any quantile, full fidelity
+```
+
+Pre-bucketing into p50/p90/p99 at the OS level would bake in a decision about which quantiles matter — and that decision is always wrong for someone. A pre-bucketed histogram with 1000 bins cannot compute p99.9 accurately if the tail is sparse; it cannot compute a novel quantile at all after the fact. Raw samples have none of these limitations. Every quantile is computable. Full fidelity. No precision loss at the tail.
+
+The `size` declaration is the programmer's statement of how many samples to retain. The `ObservabilityCircuit` writes each tick delta into the channel as a plain `Tick` value at the circuit's window close — one write per execution, in the channel's declared `permanent` tier, which is never paged out. When the channel reaches capacity the oldest samples are overwritten in ring-buffer order — the most recent N executions are always available. The size is declared in the manifest and verified against physical DRAM capacity at compile time, the same as every other `permanent` value.
 
 You run the code — in production, on real data, under real load — and you read the channel. There is no synthetic harness, no warmup phase, no separate measurement binary. The measurement is the programme.
 
@@ -824,11 +835,11 @@ You run the code — in production, on real data, under real load — and you re
 
 A conventional benchmark runs synthetic workloads in isolation under controlled conditions, with a warmup phase to prime the cache. It measures a proxy for production behaviour. The proxy is imprecise because the cache state at benchmark start differs from production, the data is synthetic rather than real, and the benchmark harness's own instruction mix appears in the measurement window. The result is a number that approximates production timing but cannot be the same thing.
 
-`@Measure` measures production execution. The circuit is already running in its declared window, against real inputs, with its working set already pinned to L1 by the runtime before its first instruction. The start and end `CLKIN` ticks are read by the runtime as part of normal dispatch-loop EVALUATE — the measurement adds zero overhead to the circuit's own budget. The `ObservabilityCircuit` accumulates the deltas in its own declared window, isolated from the hot path. The percentile distribution is over every actual production execution, not over a synthetic proxy.
+`@Measure` measures production execution. The circuit is already running in its declared window, against real inputs, with its working set already pinned to L1 by the runtime before its first instruction. The start and end `CLKIN` ticks are read by the runtime as part of normal dispatch-loop EVALUATE — the measurement adds zero overhead to the circuit's own budget. The `ObservabilityCircuit` writes the delta in its own declared window, isolated from the hot path. The sample set is every actual production execution, not a synthetic proxy.
 
-The percentile calculation is exact, not sampled. Every atom produces a `TraceEvent` with its actual tick delta. The `ObservabilityCircuit` accumulates every delta into a declared-size histogram (`permanent` tier) and computes percentiles at its declared low-frequency cycle. The p99 you read from `ParsePriceMeasurement` is the true 99th percentile of every execution since the measurement window opened — not a statistical estimate over a sample, not a best-of-N over warmup runs.
+The measurement infrastructure is not a library. It is the OS. The `ObservabilityCircuit` is already running — it was declared in `system.cap` at boot alongside `ClockCircuit` and `MemoryCircuit`. The trace unit is already streaming `TraceEvent` atoms. The tick counters are already being read every window. `@Measure` does not introduce new machinery — it names a measurement point within infrastructure that already exists and was already running before your circuit was slotted. You do not pay for it. You do not import it. You do not configure it. You annotate and the OS does the rest, precisely, in hardware, at `CLKIN` resolution, from the first execution to the last.
 
-**Intra-window checkpoints.** If the full-window distribution is insufficient and you need to locate where within a window the time is spent:
+**Intra-window checkpoints.** If the full-window sample is insufficient and you need to locate where within a window the time is spent:
 
 ```
 fn parse(frame: channel EthernetFrame) = {
@@ -841,16 +852,29 @@ fn parse(frame: channel EthernetFrame) = {
 }
 ```
 
-Each `@Checkpoint` annotation inserts a single `CNTVCT_EL0` (or `RDTSC`) read at that point in the instruction sequence. The compiler includes the cost of that read — one instruction — in the budget analysis. The checkpoint emits a delta to `channel ParsePriceCheckpoints`, a structured stream with one entry per label per execution. The `ObservabilityCircuit` accumulates checkpoint deltas into per-label distributions alongside the full-window distribution. The result: you know not just that p99 of `parsePrice` is 3.1 ns, but that 2.4 ns of it is in `headerParsed` and 0.7 ns is in `payloadDecoded` — from production data, with no profiler, no instrumented build, no loss of fidelity.
-
-**Measurement channels are first-class subscribers.** Any declared circuit can subscribe to a measurement channel. An alert circuit can declare:
+Each `@Checkpoint` annotation inserts a single `CNTVCT_EL0` (or `RDTSC`) read at that label in the instruction sequence. The compiler includes the cost of that read — one instruction — in the budget analysis. The checkpoint emits a delta to `channel ParsePriceCheckpoints`, one `Tick` per label per execution. Each label gets its own sample set, accumulated in the same `permanent` ring buffer. You call `percentile` on any label's samples the same way:
 
 ```
-@Alert(channel = ParsePriceMeasurement, condition = "p99 > budget * 0.9")
-circuit ParsePriceAlert { ... }
+val headerSamples  = ParsePriceCheckpoints.get("headerParsed")
+val payloadSamples = ParsePriceCheckpoints.get("payloadDecoded")
+val p99Header      = percentile(headerSamples, 99.0)
 ```
 
-This fires a `channel AlertSignal` if the p99 crosses 90% of the declared budget — before any violation occurs. The alert circuit runs in its own declared window, reads the measurement channel written by the `ObservabilityCircuit`, and emits the signal through the normal channel mechanism. No polling. No external monitoring system. No Prometheus scrape interval. The measurement is in the system. The alert is in the system. The channel is the interface.
+**Measurement channels are first-class subscribers.** Any declared circuit can subscribe to a measurement channel. An alert circuit reads the raw samples and applies whatever condition it declares:
+
+```
+circuit ParsePriceAlert {
+    fn evaluate(samples: channel ParsePriceMeasurement) = {
+        val tail = percentile(samples, 99.9)
+        match tail > budget * 0.9 {
+            true  => AlertSignal.put(ParsePriceBudgetWarning { tail, budget })
+            false => ()
+        }
+    }
+}
+```
+
+The alert circuit runs in its own declared window, reads the sample channel, computes the quantile it cares about, and emits through the normal channel mechanism. It is not constrained to fixed percentiles declared at annotation time — it computes whatever the circuit logic requires, from the full sample set, at the precision the full sample set allows. No polling. No external monitoring system. No Prometheus scrape interval. The samples are in the system. The analysis is in the system. The channel is the interface.
 
 ---
 
