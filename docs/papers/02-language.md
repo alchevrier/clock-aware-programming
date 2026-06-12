@@ -56,26 +56,26 @@ switch (event) {
 
 ### Lifetime Types — The Memory Tier System
 
-Lifetime types are the second rule. They are type keywords — the same way `int` declares a value is an integer, `Permanent` declares a value lives for the programme's lifetime in pinned DRAM. The compiler maps the declaration to the correct physical tier, pins the value there, and reclaims it at the declared boundary. No `malloc`. No `free`. No GC. The lifetime declaration is the memory contract.
+Lifetime types are the second rule. They are type keywords — the same way `int` declares a value is an integer, `permanent` declares a value lives for the programme's lifetime in pinned DRAM. The compiler maps the declaration to the correct physical tier, pins the value there, and reclaims it at the declared boundary. No `malloc`. No `free`. No GC. The lifetime declaration is the memory contract.
 
 | Lifetime | Scope | Maps to | Notes |
 |---|---|---|---|
-| `Register` | Single expression | Registers only | Never touches memory; guaranteed, not hinted |
-| `Ephemeral` | Function scope | L1, pinned | Intermediate results, parsing scratch, message buffers |
-| `Task` | Current cycle window | L1/L2, pinned for window duration | Active transaction state, channel read buffers |
-| `Session` | Lifetime of a connection or run | DRAM, resident | Connection state, compiled code cache, configuration |
-| `Permanent` | Programme lifetime | DRAM, pinned — never paged | Model weights, read-only lookup tables, static data |
+| `register` | Single expression | Registers only | Never touches memory; guaranteed, not hinted |
+| `ephemeral` | Function scope | L1, pinned | Intermediate results, parsing scratch, message buffers |
+| `task` | Current cycle window | L1/L2, pinned for window duration | Active transaction state, channel read buffers |
+| `session` | Lifetime of a connection or run | DRAM, resident | Connection state, compiled code cache, configuration |
+| `permanent` | Programme lifetime | DRAM, pinned — never paged | Model weights, read-only lookup tables, static data |
 | `cold` | Indefinite, infrequently accessed | NVMe, demand-loaded | Historical data, audit logs — loaded at declared cycle, no surprise page faults |
 
 `cold` is the tier no managed language can express. Java, Go, Python have no concept of "load this at a declared cycle from storage." In the clock-aware model, a `cold` access is declared, its load cycle is verified against the NVMe latency in `system.cap`, and the compiler rejects declarations whose timing budget is insufficient. Storage latency becomes a compile-time constraint, not a runtime surprise.
 
-**The compiler guarantees L1 utilisation.** `system.cap` declares the L1 cache capacity of the target core. The compiler sums the declared footprints of every `Ephemeral` and `Task` value in a circuit's active window — every collection size, every channel buffer, every intermediate value. If the total exceeds the L1 capacity declared for the assigned core, the compiler rejects the programme with a precise error: which values, how many bytes each, and by how much the L1 is exceeded. If it fits, the compiler emits a proof that the circuit's hot path working set is entirely resident in L1 for the duration of its window — no evictions, no reloads, no cache misses. This proof is part of the manifest. The trace unit validates it at runtime: a cache miss on the hot path of a circuit with a passing L1 proof is a `channel ExecutionPlanViolation` signal, flagging either a hardware anomaly or a compiler model mismatch against `system.cap`.
+**The compiler guarantees L1 utilisation.** `system.cap` declares the L1 cache capacity of the target core. The compiler sums the declared footprints of every `ephemeral` and `task` value in a circuit's active window — every collection size, every channel buffer, every intermediate value. If the total exceeds the L1 capacity declared for the assigned core, the compiler rejects the programme with a precise error: which values, how many bytes each, and by how much the L1 is exceeded. If it fits, the compiler emits a proof that the circuit's hot path working set is entirely resident in L1 for the duration of its window — no evictions, no reloads, no cache misses. This proof is part of the manifest. The trace unit validates it at runtime: a cache miss on the hot path of a circuit with a passing L1 proof is a `channel ExecutionPlanViolation` signal, flagging either a hardware anomaly or a compiler model mismatch against `system.cap`.
 
 The guarantee is not "probably L1-resident" or "L1-resident under normal conditions". It is unconditional: the working set fits by construction, and any deviation is immediately observable and attributed.
 
 The runtime extends this statically: it tracks L1 utilisation live via the atom stream. Each atom carries the actual cache line occupancy of the circuit that just executed. The `ObservabilityCircuit` aggregates this into a per-core L1 pressure map updated every tick. When a core's L1 pressure consistently falls below a threshold — because circuits are finishing with significant working-set slack — the runtime has two responses:
 
-1. **Adjust the execution plan.** The runtime signals the `AdaptationCircuit` via `channel L1Advisory`. The adaptation circuit can recommend promoting a `Session`-tier value to `Ephemeral` for that core — pre-loading it into L1 ahead of the next window that needs it — reducing effective access latency without the programmer declaring it. The compiler's static proof is the floor; the runtime's promotion is a safe tightening within it.
+1. **Adjust the execution plan.** The runtime signals the `AdaptationCircuit` via `channel L1Advisory`. The adaptation circuit can recommend promoting a `session`-tier value to `ephemeral` for that core — pre-loading it into L1 ahead of the next window that needs it — reducing effective access latency without the programmer declaring it. The compiler's static proof is the floor; the runtime's promotion is a safe tightening within it.
 
 2. **Switch `clock_model`.** A core whose L1 is consistently underutilised is a core whose circuits are consistently finishing early. The runtime can downgrade its `clock_model` from `Performance` to `Balanced` — reducing frequency and power — with the proof that the circuits' declared windows still close in time at the lower frequency. The switch is not a guess. It is derived from the L1 utilisation data and the compiler's known instruction count for each circuit on that core.
 
@@ -111,7 +111,7 @@ The clock-aware model closes the gap by making the connection at compile time. T
 
 The language surface is Java-like in familiarity but Kotlin-like in concision: `fn` for functions, return types inferred, `val` for immutable bindings. No `void`. No explicit `return` for single-expression functions. Learnable in days.
 
-The language has seven reserved lowercase keywords that define the computational model. Everything else is a name the programmer chooses:
+The language has eleven reserved lowercase keywords that define the computational model. Everything else is a name the programmer chooses:
 
 | Keyword | What it declares |
 |---|---|
@@ -119,11 +119,15 @@ The language has seven reserved lowercase keywords that define the computational
 | `circuit` | A stateful clocked block with self-feeding internal channels. The fundamental organisational primitive. Not a class. Not an object. |
 | `channel` | A typed data flow path — between circuits, or inside a circuit as self-feeding state. The only persistence mechanism. |
 | `clock` | A hardware clock source, declared by name. All timing annotations resolve against a declared `clock`. |
-| `register` | Lifetime tier: CPU register file. Expires at expression boundary. |
-| `memory` | Lifetime tier: in-core (L1/L2 pinned) or DRAM resident. Persists across clock boundaries. |
+| `register` | Lifetime tier: CPU register file. Expires at expression boundary. Never touches memory. |
+| `ephemeral` | Lifetime tier: L1 cache, pinned. Function scope. Intermediate results, parsing scratch, message buffers. |
+| `task` | Lifetime tier: L1/L2 cache, pinned for the current cycle window. Active transaction state, channel read buffers. |
+| `session` | Lifetime tier: DRAM, resident. Lifetime of a connection or run. Connection state, configuration. |
+| `permanent` | Lifetime tier: DRAM, pinned — never paged. Programme lifetime. Model weights, read-only lookup tables, static data. |
+| `memory` | Qualifier: in-core memory (covers `ephemeral`, `task`, `session`, `permanent`). Used when the tier is inferred from scope. |
 | `cold` | Lifetime tier: NVMe / off-core storage. Demand-loaded, declared access window. |
 
-There are no other primitive concepts. Every construct in the language is built from these seven reserved words.
+There are no other primitive concepts. Every construct in the language is built from these eleven reserved words.
 
 A `fn` is combinational logic — the gate, not the flip-flop. Its output is a signal — the value the function produces. That signal is the return value, not a parameter. There is no output wire passed as input:
 

@@ -191,12 +191,12 @@ The following is a speculative but derivable estimate of what equivalent inferen
 | **Today — GPU-based** | 2× NVIDIA A100 80GB + host server | ~HK$180,000 | VRAM capacity, PCIe bandwidth, OOO overhead |
 | **Today — Apple M-series** | Mac Studio Ultra (192GB unified) | ~HK$40,000 | OOO overhead, memory bandwidth shared with CPU |
 | **Clock-aware Gen 1** *(commodity silicon, software model only)* | Existing AArch64 server, clock-aware runtime, no custom silicon | ~HK$15,000 | ISA legacy overhead, no hardware specialisation |
-| **Clock-aware Gen 2** *(custom silicon, declared tiers)* | Clock-aware CPU, HBM4 Task tier, LPDDR6 Session tier, no discrete GPU | ~HK$8,000 | Memory bandwidth (no other bottleneck — all eliminated) |
+| **Clock-aware Gen 2** *(custom silicon, declared tiers)* | Clock-aware CPU, HBM4 task tier, LPDDR6 session tier, no discrete GPU | ~HK$8,000 | Memory bandwidth (no other bottleneck — all eliminated) |
 | **Clock-aware Gen 2 + GPU ALU array** | Gen 2 CPU + specialised matmul/softmax silicon (no CUDA generality) | ~HK$5,000 | Pure compute throughput — all other overhead eliminated |
 
 The Gen 1 estimate reflects running the clock-aware software model on existing commodity hardware: no custom silicon, but the runtime eliminates OS overhead, removes the scheduler jitter, pre-allocates memory, and eliminates GC. The performance improvement comes purely from software — the hardware is unchanged. The cost reduction comes from not needing discrete GPUs, because the unified memory and the optimised runtime together bring inference within reach on a standard server.
 
-The Gen 2 estimate reflects what happens when the hardware is redesigned for the model: OOO engine eliminated (→ more cores), L3 eliminated (→ more execution ports), coherency hardware eliminated (→ simpler die), VRAM/DRAM boundary eliminated (→ one pool). The 80–120 clock-aware cores per die replace 16 OOO cores, at lower manufacturing cost per core and better yield. The HBM4 tier is sized only for the declared `Task`-scoped working set — a fraction of what a GPU's VRAM pool requires.
+The Gen 2 estimate reflects what happens when the hardware is redesigned for the model: OOO engine eliminated (→ more cores), L3 eliminated (→ more execution ports), coherency hardware eliminated (→ simpler die), VRAM/DRAM boundary eliminated (→ one pool). The 80–120 clock-aware cores per die replace 16 OOO cores, at lower manufacturing cost per core and better yield. The HBM4 tier is sized only for the declared `task`-scoped working set — a fraction of what a GPU's VRAM pool requires.
 
 The Gen 2 + GPU ALU array estimate reflects replacing CUDA cores with operation-class-specialised units: the matmul array, the softmax reduction tree, the cordic pipeline. No generalisation tax. Every transistor in the accelerator does exactly the operation the declared workload requires.
 
@@ -306,12 +306,12 @@ Declared lifetimes change this. When the compiler knows at build time exactly ho
 
 | Tier | Technology | Latency | Cost | Sized by |
 |---|---|---|---|---|
-| `Register` / `Ephemeral` | SRAM (registers, L1) | ~4 cycles | Very high per bit | Declared ephemeral working set — stays small |
-| `Task` / `Warm` | HBM4 (High Bandwidth Memory) | ~10 cycles | High, high bandwidth | Declared hot working set — exactly as large as needed, no waste |
-| `Session` / `Resident` | LPDDR6 (Low Power DDR) | ~100 cycles | Low, low power | Everything that lives long |
+| `Register` / `ephemeral` | SRAM (registers, L1) | ~4 cycles | Very high per bit | Declared ephemeral working set — stays small |
+| `task` / `Warm` | HBM4 (High Bandwidth Memory) | ~10 cycles | High, high bandwidth | Declared hot working set — exactly as large as needed, no waste |
+| `session` / `Resident` | LPDDR6 (Low Power DDR) | ~100 cycles | Low, low power | Everything that lives long |
 | `Cold` | NAND / NVMe | ~10,000 cycles | Very cheap per GB | Loaded at declared cycle — no surprise page faults, no demand-paging latency |
 
-Today HBM is used in high-end GPUs and AI accelerators — at enormous cost, because the entire VRAM pool must be HBM to avoid the worst-case miss. With declared lifetimes, only the declared `Task`-scoped working set needs HBM — a fraction of the total memory footprint. The rest is LPDDR6, which is cheap and power-efficient. The system pays for high-bandwidth memory only where the declarations prove it is needed.
+Today HBM is used in high-end GPUs and AI accelerators — at enormous cost, because the entire VRAM pool must be HBM to avoid the worst-case miss. With declared lifetimes, only the declared `task`-scoped working set needs HBM — a fraction of the total memory footprint. The rest is LPDDR6, which is cheap and power-efficient. The system pays for high-bandwidth memory only where the declarations prove it is needed.
 
 The `Cold` tier is the most significant new capability. No managed language can express "load this value from storage at a declared cycle with a declared latency budget." Page faults are invisible, unpredictable, and cannot be proven absent. In the clock-aware model, a `Cold` access is declared, its load cycle is verified against the latency of the NVMe tier in `system.cap`, and the compiler rejects declarations whose timing budget is insufficient to cover the load. Storage latency becomes a compile-time constraint, not a runtime surprise.
 
@@ -353,7 +353,7 @@ Not all hardware resources behave deterministically. The clock-aware model disti
 
 **Imprecise resources** — resources whose timing has a distribution rather than a fixed value. A DRAM row activation, a NVMe read with queue depth contention, a network round-trip — these have declared *bounds* but not declared *exact cycles*. The compiler treats imprecise resources as `Cold` accesses: the declared bound is verified as achievable in the worst case, the actual cycle is whatever the hardware delivers, and the circuit's declared window covers the bound. The gap between actual and bound is absorbed as slack.
 
-The distinction matters for correctness. A `Permanent` tier access (DRAM, pinned) is precise — the compiler knows the exact row-to-column latency. A `Cold` tier access (NVMe) is imprecise — the compiler knows the declared worst-case, but not the actual. A circuit that treats an imprecise resource as precise — declaring a cycle budget too tight for the worst case — is a compile error. The compiler, reading the resource classification from `system.cap`, rejects declarations that conflate the two.
+The distinction matters for correctness. A `permanent` tier access (DRAM, pinned) is precise — the compiler knows the exact row-to-column latency. A `Cold` tier access (NVMe) is imprecise — the compiler knows the declared worst-case, but not the actual. A circuit that treats an imprecise resource as precise — declaring a cycle budget too tight for the worst case — is a compile error. The compiler, reading the resource classification from `system.cap`, rejects declarations that conflate the two.
 
 ### Device Learning and Calibration
 

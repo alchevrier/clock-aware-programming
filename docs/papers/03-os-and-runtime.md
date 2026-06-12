@@ -55,16 +55,16 @@ The runtime loads this profile and hands it to the observability sub-circuit, wh
 
 ```
 tier     Register    size  8B     scope  expression   count  12 per window
-tier     Ephemeral   size  64B    scope  function     count  3 per window
-tier     Task        size  128B   scope  window       count  1
-tier     Session     size  10MB   scope  circuit      count  1   (RiskLimitTable)
+tier     ephemeral   size  64B    scope  function     count  3 per window
+tier     task        size  128B   scope  window       count  1
+tier     session     size  10MB   scope  circuit      count  1   (RiskLimitTable)
 ```
 
 The runtime reads this table when slotting the circuit and pre-allocates exactly these amounts from the correct tiers before the first window opens. There is no runtime heap introspection. There is no "how much memory is this process using?" query — the answer was known at compile time and is in the manifest. The runtime's memory accounting is a subtraction: total tier capacity minus the sum of all slotted circuit manifests. Out-of-memory is when that subtraction goes negative, detected at slot time, before any allocation is attempted.
 
 **Physical placement.** The compiler knows — from `system.cap` and the handoff graph — which core each window is assigned to, which cache domain each tier-resident value sits in, and which coherency gap separates each cross-core handoff. This placement is fixed in the manifest. The runtime does not re-derive it. It reads the placement, pins the memory, and programs the dispatch table entry.
 
-The consequence is that the system's complete resource utilisation — across all slotted circuits — is the sum of their manifests. The runtime can answer, at any point, without any measurement: how many ticks on core 2 are allocated; how many bytes of DRAM are committed to `Session` tier; which channels are at peak utilisation; which circuits share a cache domain. These are not runtime metrics gathered by a monitoring daemon. They are compile-time theorems, readable from the manifest table. The observability sub-circuit reports deviations from those theorems. The theorems themselves never change while the system is running.
+The consequence is that the system's complete resource utilisation — across all slotted circuits — is the sum of their manifests. The runtime can answer, at any point, without any measurement: how many ticks on core 2 are allocated; how many bytes of DRAM are committed to `session` tier; which channels are at peak utilisation; which circuits share a cache domain. These are not runtime metrics gathered by a monitoring daemon. They are compile-time theorems, readable from the manifest table. The observability sub-circuit reports deviations from those theorems. The theorems themselves never change while the system is running.
 
 ### Dynamic Memory Is a Channel with a Declared Size
 
@@ -112,11 +112,11 @@ The model pushes SQL-style applications toward streaming-first design: declare t
 
 ### The Weak Point Dissolves: Every Production System Already Declares Bounds
 
-The apparent weakness of the declared-footprint model — that `Session` and `Permanent` tier sizes must be declared at compile time — dissolves on inspection. No production system runs with truly unbounded memory. Every deployed JVM has `-Xmx`. Every production PostgreSQL has `shared_buffers`. Every Kubernetes pod has a memory limit. Every embedded system has a linker script with fixed section sizes. The bounds are always declared somewhere — in a config file, a deployment manifest, a command-line flag, an operations runbook.
+The apparent weakness of the declared-footprint model — that `session` and `permanent` tier sizes must be declared at compile time — dissolves on inspection. No production system runs with truly unbounded memory. Every deployed JVM has `-Xmx`. Every production PostgreSQL has `shared_buffers`. Every Kubernetes pod has a memory limit. Every embedded system has a linker script with fixed section sizes. The bounds are always declared somewhere — in a config file, a deployment manifest, a command-line flag, an operations runbook.
 
 The difference is where the declaration lives and when it is verified. In a Java application, the heap bound is a runtime flag passed to the JVM at launch — not verified against the programme's actual memory behaviour, not checked against the data structures the programme allocates, not proved consistent with the programme's timing. The flag is an operational constraint applied outside the language. The programme can be written to require more than the flag permits, and nobody will discover this until the JVM throws `OutOfMemoryError` in production.
 
-In the clock-aware model, the bound is declared in the programme itself — as a `Session` or `Permanent` type with a declared size — and the compiler verifies it is consistent with everything the circuit accesses. The declaration is the same fact the operations team would have put in `-Xmx`. It is just in the right place: in the source, verified at compile time, part of the manifest the runtime loads.
+In the clock-aware model, the bound is declared in the programme itself — as a `session` or `permanent` type with a declared size — and the compiler verifies it is consistent with everything the circuit accesses. The declaration is the same fact the operations team would have put in `-Xmx`. It is just in the right place: in the source, verified at compile time, part of the manifest the runtime loads.
 
 Re-slotting handles growth: when the declared bound proves insufficient at runtime, the circuit signals the runtime, which removes and re-slots it with an updated manifest and a larger declared size. This is the same operation as a rolling restart with a larger `-Xmx` — but initiated by the circuit itself through a declared channel, rather than by an operator running a shell command. The pause is equivalent; the mechanism is structural.
 
@@ -669,11 +669,11 @@ The mechanism depends on the declared lifetime tier of the value being handed of
 
 **Register-based handoff — same core, consecutive windows.**
 
-If the value's lifetime is `Register` or `Ephemeral`, it never needs to leave the CPU's register file. The compiler arranges consecutive windows on the same core so that the output registers of window N are the input registers of window N+1. No store. No load. No memory traffic at all. The handoff costs zero cycles because the data is already in the right place. This is identical to how a hardware pipeline passes a value between stages through a flip-flop: the register is the pipeline register.
+If the value's lifetime is `Register` or `ephemeral`, it never needs to leave the CPU's register file. The compiler arranges consecutive windows on the same core so that the output registers of window N are the input registers of window N+1. No store. No load. No memory traffic at all. The handoff costs zero cycles because the data is already in the right place. This is identical to how a hardware pipeline passes a value between stages through a flip-flop: the register is the pipeline register.
 
 **Memory-based handoff — same core, higher lifetime.**
 
-If the value's lifetime is `Task` or `Session`, it lives in L1 or L2 (pinned). The compiler emits the store at the last instruction of window N. The reader's window N+1 opens on the same core immediately after. The store-to-load forwarding path in the CPU delivers the value from the store buffer before it even reaches L1 — the latency is zero observable cycles for the reader. The compiler knows the store-forward latency for the declared `cpu_model` and schedules the window gap to be ≥ that latency. The latency is absorbed in the gap between windows, charged to neither circuit's budget.
+If the value's lifetime is `task` or `session`, it lives in L1 or L2 (pinned). The compiler emits the store at the last instruction of window N. The reader's window N+1 opens on the same core immediately after. The store-to-load forwarding path in the CPU delivers the value from the store buffer before it even reaches L1 — the latency is zero observable cycles for the reader. The compiler knows the store-forward latency for the declared `cpu_model` and schedules the window gap to be ≥ that latency. The latency is absorbed in the gap between windows, charged to neither circuit's budget.
 
 **Cross-core handoff — different cores, same or different dies.**
 
@@ -681,14 +681,14 @@ The compiler reads the cache topology from `system.cap`: same L3 domain, differe
 
 **RAM-direct handoff — bypassing cache when the window budget allows.**
 
-For large `Permanent` or `Cold`-tier values — reference tables, ML weight tensors, bulk datasets — the cache hierarchy is not the right path. These values do not fit in L1 or L2. Normally this means cache pressure and eviction. In the clock-aware model, the compiler knows the declared size of every value and its tier. If a circuit's window budget is large enough to absorb DRAM latency directly — typically 100–300 ticks for a local DRAM access at declared physical address — the compiler routes the access directly to RAM, bypassing the cache hierarchy entirely. No cache line is brought in. No cache line is evicted to make room. The DRAM access is declared, timed, and absorbed in the window gap. Cache pollution from large cold reads is structurally impossible — the compiler never routes them through L1 in the first place. The cache is reserved for what is proven to be hot.
+For large `permanent` or `Cold`-tier values — reference tables, ML weight tensors, bulk datasets — the cache hierarchy is not the right path. These values do not fit in L1 or L2. Normally this means cache pressure and eviction. In the clock-aware model, the compiler knows the declared size of every value and its tier. If a circuit's window budget is large enough to absorb DRAM latency directly — typically 100–300 ticks for a local DRAM access at declared physical address — the compiler routes the access directly to RAM, bypassing the cache hierarchy entirely. No cache line is brought in. No cache line is evicted to make room. The DRAM access is declared, timed, and absorbed in the window gap. Cache pollution from large cold reads is structurally impossible — the compiler never routes them through L1 in the first place. The cache is reserved for what is proven to be hot.
 
 **The system as a whole is a deeply pipelined machine.**
 
 ```
 core 2, tick  0–12:  parsePrice     → produces channel Price   (Register lifetime)
 core 2, tick 12–22:  updateBook     → consumes channel Price   (same core, register handoff, 0 cycles)
-core 2, tick 22–34:  emitQuote      → consumes OrderBook state  (Task lifetime, L1 pinned)
+core 2, tick 22–34:  emitQuote      → consumes OrderBook state  (task lifetime, L1 pinned)
 core 0, tick 14–30:  riskCheck      → consumes channel Price   (cross-core, gap ≥ coherency latency)
 ```
 
@@ -702,7 +702,7 @@ The CPU's own hardware pipeline — out-of-order execution, store forwarding, pr
 
 The runtime tracks register file state across window boundaries. When a circuit completes its window, the runtime records which registers hold live values — values that the next circuit on the same core declares as inputs. Those registers are not clobbered between windows. The next circuit's first instruction reads directly from the register the previous circuit's last instruction wrote to — no store, no load, no memory traffic. This is **software register forwarding**: the runtime maintains a per-core register liveness map, derived from the manifest's declared channel types, and the compiler emits instruction sequences that assume the forwarded register state is already present. Register-lifetime handoffs cost zero cycles not by coincidence but by construction.
 
-Each circuit executes on its own declared stack — not the hardware stack. The hardware stack pointer (`SP`) is reserved exclusively for the runtime's dispatch loop itself: a fixed, small, runtime-only stack that never grows during normal circuit execution. Every circuit has a declared stack region in its manifest, pre-allocated in the `Task` tier (L1/L2 pinned) before the circuit's first window opens. The runtime maintains a **multi-stack pipeline**: each slot in the dispatch table has its own base pointer into its pre-allocated stack region. Switching between circuits requires no register-save/restore — the next circuit's registers are already known from the forwarding map, and its stack is already present in L1. A circuit transition costs exactly the ticks between window boundaries. Nothing more.
+Each circuit executes on its own declared stack — not the hardware stack. The hardware stack pointer (`SP`) is reserved exclusively for the runtime's dispatch loop itself: a fixed, small, runtime-only stack that never grows during normal circuit execution. Every circuit has a declared stack region in its manifest, pre-allocated in the `task` tier (L1/L2 pinned) before the circuit's first window opens. The runtime maintains a **multi-stack pipeline**: each slot in the dispatch table has its own base pointer into its pre-allocated stack region. Switching between circuits requires no register-save/restore — the next circuit's registers are already known from the forwarding map, and its stack is already present in L1. A circuit transition costs exactly the ticks between window boundaries. Nothing more.
 
 ### The Trace Unit — Proving the Compiler Was Right
 
@@ -761,19 +761,19 @@ This has a precise consequence for reclaim. Because the runtime provided every b
 | Lifetime | Reclaim trigger | Reclaim cost |
 |---|---|---|
 | `Register` | Expression boundary | Zero — register file reuse |
-| `Ephemeral` | Function return | Zero — L1 slot reuse |
-| `Task` | Cycle window close | Zero — L1/L2 slot reuse |
-| `Session` | Circuit removal | Single range deallocation |
-| `Permanent` | Programme termination | Single range deallocation |
+| `ephemeral` | Function return | Zero — L1 slot reuse |
+| `task` | Cycle window close | Zero — L1/L2 slot reuse |
+| `session` | Circuit removal | Single range deallocation |
+| `permanent` | Programme termination | Single range deallocation |
 | `Cold` | Declared unload cycle | NVMe page reclaim |
 
 "Reclaim cost" is zero for the hot tiers because there is nothing to collect — the slot was pre-allocated, the window closed, the same slot is used for the next circuit's matching tier. There is no free list to walk, no reference count to decrement, no mark phase, no sweep phase. The runtime increments a pointer. The slot is reclaimed.
 
-For `Session` values — cross-circuit handoffs like `riskLimits` — reclaim happens when the owning circuit is removed from the dispatch table. The runtime reads the circuit's manifest, walks its declared `Session` values, and releases each range back to the DRAM pool in a single operation. The cost is proportional to the number of declared `Session` values in the manifest, not to the size of the data. The runtime never touches the data itself — it reclaims the address range. A `Session<RiskLimitTable>` with 10 MB of data costs the same to reclaim as one with 10 bytes.
+For `session` values — cross-circuit handoffs like `riskLimits` — reclaim happens when the owning circuit is removed from the dispatch table. The runtime reads the circuit's manifest, walks its declared `session` values, and releases each range back to the DRAM pool in a single operation. The cost is proportional to the number of declared `session` values in the manifest, not to the size of the data. The runtime never touches the data itself — it reclaims the address range. A `session<RiskLimitTable>` with 10 MB of data costs the same to reclaim as one with 10 bytes.
 
 This is why the runtime must be the sole provider. A circuit that allocated its own memory would hold a range the runtime does not know about. The runtime could not reclaim it at circuit removal without scanning — which requires knowing where to scan, which requires the circuit to have declared it. The declaration is the allocation. The allocation is the declaration. The runtime holds both ends of the same fact.
 
-The programmer never sees this. They declare `Session<RiskLimitTable>` and write to it. The runtime provided the memory before the first write. The runtime reclaims it after the last read. The circuit never held a pointer to an allocator, never called a destructor, never decremented a reference count. The lifecycle is not managed — it is declared. The runtime executes the declaration.
+The programmer never sees this. They declare `session<RiskLimitTable>` and write to it. The runtime provided the memory before the first write. The runtime reclaims it after the last read. The circuit never held a pointer to an allocator, never called a destructor, never decremented a reference count. The lifecycle is not managed — it is declared. The runtime executes the declaration.
 
 ### Unaligned Cache Lines — Compile-Time Padding
 
@@ -791,7 +791,7 @@ The removal protocol:
 
 2. **The circuit acknowledges and completes its current window.** It does not abort mid-execution. Its current window runs to completion — the timing guarantee is not violated by removal. At the window close, the circuit writes a `channel RemovalAck` back to the runtime.
 
-3. **The runtime removes the circuit from the dispatch table.** Its windows are released. Its channel subscriptions are unregistered. Its entire declared working set — every `Session`, every `Task`, every `Permanent` value in its manifest — is reclaimed in a single manifest-walk. No scan. No pointer traversal. The runtime reads the manifest entries and releases the address ranges.
+3. **The runtime removes the circuit from the dispatch table.** Its windows are released. Its channel subscriptions are unregistered. Its entire declared working set — every `session`, every `task`, every `permanent` value in its manifest — is reclaimed in a single manifest-walk. No scan. No pointer traversal. The runtime reads the manifest entries and releases the address ranges.
 
 4. **The cause is written to the observability log.** The removal event is a `channel CircuitEvent` write to the observability sub-circuit, containing: circuit identity, removal cause (`OutOfMemory`), tier that was exhausted, bytes reclaimed, timestamp in ticks, and the identity of the circuit whose slot request triggered the removal. The log entry is structural — it is a typed channel write, not a string printed to stderr.
 
@@ -812,7 +812,7 @@ A traditional filesystem bundles three distinct concerns: block I/O, caching, an
 
 **Block I/O** is the NVMe driver circuit: DMA-paced, DREQ-driven, timing declared, no polling, no blocking. It is already present in the OS circuit collection.
 
-**Caching** is the tier system itself. Data that starts in the `Cold` tier (NVMe, demand-loaded) and is promoted to `Permanent` or `Session` (DRAM, pinned) *is* the cache — with the promotion policy declared at compile time rather than managed by a page replacement algorithm at runtime. There is no separate buffer cache to maintain. There is no `drop_caches`. The tier system is the cache, and the runtime is its manager.
+**Caching** is the tier system itself. Data that starts in the `Cold` tier (NVMe, demand-loaded) and is promoted to `permanent` or `session` (DRAM, pinned) *is* the cache — with the promotion policy declared at compile time rather than managed by a page replacement algorithm at runtime. There is no separate buffer cache to maintain. There is no `drop_caches`. The tier system is the cache, and the runtime is its manager.
 
 **The namespace** — the mapping from names to locations in the `Cold` tier — is the one part that requires a dedicated circuit. This is the `NamespaceCircuit`:
 
@@ -838,14 +838,14 @@ The `NamespaceCircuit` maps identifiers — circuit names, handoff keys, manifes
 | Traditional filesystem concern | Clock-aware equivalent | Where it lives |
 |---|---|---|
 | Block I/O | NVMe driver circuit | OS circuit collection |
-| Page cache / buffer cache | `Permanent` / `Session` tier promotion | Runtime tier manager |
+| Page cache / buffer cache | `permanent` / `session` tier promotion | Runtime tier manager |
 | Cache eviction policy | Tier demotion on memory pressure | Runtime (declared weights) |
 | Journal / durability | `Cold` write-commit at clock boundary | NVMe driver circuit |
 | Namespace (paths, inodes) | `NamespaceCircuit` | OS circuit collection |
 | File locking | Channel ownership at clock boundary | Runtime ownership model |
 | `open` / `close` / `mmap` | `Cold<T>` channel subscription | Language type system |
 
-There is no `VFS` layer. There is no `inode` table separate from the namespace. There is no `dentry` cache separate from the `Permanent` tier. There is no `fsync` — the write-commit cycle boundary *is* the sync. A programme that holds a `Cold<T>` handle is subscribed to that region; when it drops the handle (removes the subscription), the runtime releases the region back to the `NamespaceCircuit`. There is no file descriptor table. There is no `open file description`. There is a typed channel subscription — the same primitive used for every other resource in the system.
+There is no `VFS` layer. There is no `inode` table separate from the namespace. There is no `dentry` cache separate from the `permanent` tier. There is no `fsync` — the write-commit cycle boundary *is* the sync. A programme that holds a `Cold<T>` handle is subscribed to that region; when it drops the handle (removes the subscription), the runtime releases the region back to the `NamespaceCircuit`. There is no file descriptor table. There is no `open file description`. There is a typed channel subscription — the same primitive used for every other resource in the system.
 
 The filesystem was always a cache manager bolted on top of block I/O with a namespace on top. When the cache manager is the runtime, the block I/O is the driver circuit, and the namespace is one more OS circuit, the filesystem disappears as a concept — and what remains is simpler, faster, and fully verified by the same compiler that verifies everything else.
 
@@ -935,7 +935,7 @@ ARM cores expose a structured set of power modes. The runtime manages these as a
 | Standby | `STANDBYWFI` / `STANDBYWFI2` | No circuit assigned this window; wake event expected soon | Short idle gaps between windows; core wakes on next declared window tick |
 | Retention | `Ret` | No circuit assigned for N ticks; L1 state must be preserved | Gaps longer than a few windows where re-powering L1 would cost more than retention |
 | Dormant | Individual Core Shutdown | Core has no assigned circuits for the foreseeable dispatch horizon | Cold cores with no scheduled work; full power removal except for wake logic |
-| Off | Full off | Core removed from `system.cap` at runtime | Permanent removal; state not preserved |
+| Off | Full off | Core removed from `system.cap` at runtime | permanent removal; state not preserved |
 
 `STANDBYWFI` (and `STANDBYWFI2` on multi-threaded cores) is the most common idle state. The runtime enters it at the end of a window when the dispatch table shows no circuit assigned for the immediately following window. The core halts execution and waits for an interrupt — in the clock-aware model, the only interrupt that fires is the hardware timer tick at the next declared window boundary. No spurious wakeup, no IRQ to classify, no scheduler to re-enter. The core wakes exactly when the next declared circuit is due, executes it, and returns to standby.
 
@@ -998,19 +998,19 @@ The handoff tier determines what kind of inter-service communication you get:
 | Handoff tier | Physical backing | Latency | Use |
 |---|---|---|---|
 | `Register` | CPU register file | 0 ticks | Same-core consecutive circuits only |
-| `Ephemeral` | L1 cache, pinned | 1–4 ticks | Same-core, tight pipeline |
-| `Task` | L1/L2, pinned | 4–12 ticks | Same-core, wider window |
-| `Session` | DRAM, resident | 50–200 ticks | Cross-core, long-lived shared state |
-| `Permanent` | DRAM, pinned, never paged | 50–200 ticks | Cross-circuit shared tables, reference data |
+| `ephemeral` | L1 cache, pinned | 1–4 ticks | Same-core, tight pipeline |
+| `task` | L1/L2, pinned | 4–12 ticks | Same-core, wider window |
+| `session` | DRAM, resident | 50–200 ticks | Cross-core, long-lived shared state |
+| `permanent` | DRAM, pinned, never paged | 50–200 ticks | Cross-circuit shared tables, reference data |
 | `Cold` | NVMe, demand-loaded | declared cycle | Infrequent bulk data |
 
-A trading engine and a risk checker on adjacent cores hand off a `Session<RiskLimit>` table: the engine writes updated limits at the end of its window; the risk checker reads them at the start of its window on the next core. No HTTP. No gRPC. No message broker. No serialisation. A memory location, a declared write tick, a declared read tick, and a compiler proof that the read comes after the write.
+A trading engine and a risk checker on adjacent cores hand off a `session<RiskLimit>` table: the engine writes updated limits at the end of its window; the risk checker reads them at the start of its window on the next core. No HTTP. No gRPC. No message broker. No serialisation. A memory location, a declared write tick, a declared read tick, and a compiler proof that the read comes after the write.
 
 The programmer can annotate handoff points to give the compiler and runtime additional information:
 
 ```java
-@Handoff(tier = Session, from = "TradingEngine", to = "RiskChecker", maxStaleness = "1ms")
-val riskLimits: Session<RiskLimitTable>
+@Handoff(tier = session, from = "TradingEngine", to = "RiskChecker", maxStaleness = "1ms")
+val riskLimits: session<RiskLimitTable>
 ```
 
 Circuit diagram — two clocked blocks, one wire, one declared memory tier:
@@ -1028,7 +1028,7 @@ Circuit diagram — two clocked blocks, one wire, one declared memory tier:
   │  └──────┘         │         │                │         ▲         └───────┘ │
   │                   │         │                │         │                   │
   │             ┌─────▼──────────────────────────────────┐│                   │
-  │             │          Session<RiskLimitTable>        ││                   │
+  │             │          session<RiskLimitTable>        ││                   │
   │             │          (DRAM, pinned, resident)       ││                   │
   │             │                                         ││                   │
   │             │  @Handoff(from = TradingEngine,         ││                   │
@@ -1048,7 +1048,7 @@ Compiler derivation table — what the compiler proves from this single annotati
 |---|---|---|
 | Producer identity | `from = "TradingEngine"` | Verifies `TradingEngine` writes `riskLimits` in its declared window. Compile error if not. |
 | Consumer identity | `to = "RiskChecker"` | Verifies `RiskChecker` reads `riskLimits` in its declared window. Compile error if not. |
-| Memory tier | `tier = Session` | Pins `riskLimits` in DRAM for programme run lifetime. Verifies declared size fits tier. |
+| Memory tier | `tier = session` | Pins `riskLimits` in DRAM for programme run lifetime. Verifies declared size fits tier. |
 | Staleness bound | `maxStaleness = "1ms"` | Translates to tick count (e.g. 3,000,000 ticks at 3 GHz). Verifies `TradingEngine`'s write period ≤ that count. Compile error if not. |
 | Coherency gap | `system.cap` cache topology | Reads L3 domain membership for core 1 and core 2. Inserts mandatory gap = cross-L3 coherency latency (e.g. 60–80 ticks) between write window end and read window start. |
 | Core placement | producer + consumer pair | Attempts to place `TradingEngine` and `RiskChecker` on cores sharing an L3 domain. If unavailable, uses next-best topology and recalculates gap. |
@@ -1072,9 +1072,9 @@ Every compiled circuit manifest is signed with the organisation's private key be
 `@Handoff` extends this naturally. A handoff between two circuits is only permitted if both manifests are signed by keys within the same declared allocation:
 
 ```java
-@Handoff(tier = Session, from = "TradingEngine", to = "RiskChecker",
+@Handoff(tier = session, from = "TradingEngine", to = "RiskChecker",
          maxStaleness = "1ms", org = "AcmeTradingCo")
-val riskLimits: Session<RiskLimitTable>
+val riskLimits: session<RiskLimitTable>
 ```
 
 The `org` field names the allocation. At compile time, the compiler verifies that both `TradingEngine` and `RiskChecker` are signed by a key in the `AcmeTradingCo` key ring declared in `system.cap`. At runtime, the dispatch table enforces it: if a circuit with a different organisational signature attempts to read `riskLimits`, the subscription check fails — not as a runtime exception, not as an access-control list lookup, but as a structural impossibility. The memory location is not addressable from outside the declared allocation.
@@ -1123,7 +1123,7 @@ The consequence is that the set of circuits permitted to execute on a given mach
 
 This extends the timing proof chain to a trust proof chain. The compiler proves timing. The signing key proves provenance. The runtime verifies both before admitting any circuit. The system's security posture is as strong as its weakest proof — and both proofs are compile-time artefacts.
 
-### The System Runs in Permanent Safe Mode
+### The System Runs in permanent Safe Mode
 
 Because every circuit that executes on the machine is cryptographically signed, the runtime operates in a state of continuous, verified trust. This has a consequence that is easy to understate: **every hardware security mechanism that exists to compensate for untrusted execution becomes unnecessary.**
 
@@ -1171,7 +1171,7 @@ while (!dmaDone()) {}           // more polling
 
 After understanding DREQ: set the PERMAP register to the peripheral's DREQ number, arm the DMA once, and the hardware paces itself forever. Zero CPU involvement on the hot path. Hundreds of lines of driver code replaced by one 5-bit field in a register — because the peripheral was already declaring its timing. The driver writer just was not listening to it.
 
-On ARM, the runtime can issue `PRFM` (Prefetch Memory) and `RPRFM` (Range Prefetch Memory, SVE2) instructions to pre-warm a circuit's working set before its window opens. During an IDLE tick — when the current core has no circuit assigned — the runtime uses the dispatch table lookahead to identify which circuit fires next and issues a range prefetch for its declared `Task`-tier working set. On the hot path, this is redundant: the speculative pre-conditioning mechanism already ensures the working set is in L1 before the window opens. `RPRFM` is most valuable for the **first dispatch of a cold circuit** that has not yet had its working set promoted: the runtime issues the prefetch during the preceding idle window, so the circuit's first execution does not pay a cold-cache penalty. After the first execution, the working set is pinned in L1 and prefetch instructions are unnecessary — the data is already there, declared to be there, proven to be there.
+On ARM, the runtime can issue `PRFM` (Prefetch Memory) and `RPRFM` (Range Prefetch Memory, SVE2) instructions to pre-warm a circuit's working set before its window opens. During an IDLE tick — when the current core has no circuit assigned — the runtime uses the dispatch table lookahead to identify which circuit fires next and issues a range prefetch for its declared `task`-tier working set. On the hot path, this is redundant: the speculative pre-conditioning mechanism already ensures the working set is in L1 before the window opens. `RPRFM` is most valuable for the **first dispatch of a cold circuit** that has not yet had its working set promoted: the runtime issues the prefetch during the preceding idle window, so the circuit's first execution does not pay a cold-cache penalty. After the first execution, the working set is pinned in L1 and prefetch instructions are unnecessary — the data is already there, declared to be there, proven to be there.
 
 The clock-aware channel model makes this structural. An SPI sensor becomes:
 
