@@ -539,9 +539,41 @@ In the ARM memory model, **Gathering** means the hardware may merge multiple acc
 
 The consequence: `dmb` / `dsb` / `isb` memory barrier instructions are absent from the hot path. A barrier is a runtime signal that the programmer could not express the ordering statically. In the clock-aware model, the ordering is declared — Gathering resources via the window boundary, Non-Gathering resources via the hardware signal. The compiler proves both. No barrier is necessary.
 
+### Channel Subscription Inference
+
+The programmer does not need to explicitly subscribe to every channel. Subscription is inferred from how the channel is used:
+
+- **A channel passed as a function parameter** is subscribed by default. The compiler sees the function's declared signature, observes the `Channel<T>` parameter, and registers the subscription in the manifest automatically. No annotation required. If the calling circuit is not in the permitted subscriber list in `system.cap`, the registration is a compile error — but the subscription intent itself does not need to be declared separately from the type.
+
+- **A channel declared as internal state** has its role — publisher or consumer — inferred from usage. If the circuit writes to it, it is a publisher. If the circuit reads from it, it is a consumer. If the circuit does both, it is a state owner — a circuit that both produces and consumes the same channel (e.g. an accumulator or a ring buffer manager). The compiler derives the role from the declared operations, not from an annotation. A mismatch — a circuit declared to publish a channel it only reads — is a compile error.
+
+The result is that channel wiring is a consequence of the type system, not a separate declaration layer. The programmer writes functions that take and return `Channel<T>` values. The compiler builds the full subscription graph from the function signatures and usage patterns. The subscription graph is the routing table. It was always implicit in the code — the compiler makes it explicit and verifiable.
+
 ---
 
 ## Execution
+
+### The Kernel Does the Hardware's Job — Better
+
+Every optimisation a modern CPU performs speculatively, the clock-aware kernel performs provably.
+
+Out-of-order execution exists because the hardware cannot know which instructions are independent — so it guesses, renames registers, and reorders speculatively, paying the cost of a reorder buffer and a misprediction flush. The compiler knows the full declared instruction sequence before any execution happens. It reorders statically, at build time, with no speculation and no flush penalty. The OOO engine is not needed — the compiler already did its job, correctly, once, before the binary shipped.
+
+Branch prediction exists because the hardware cannot know which branch a runtime value will take. The compiler eliminates branches on the hot path entirely: truth tables, `cmov`, exhaustive match compiled to jump tables. What the branch predictor guesses at, the compiler proves. The predictor is not needed for what was already decided at compile time.
+
+Register renaming exists because the hardware cannot know the programmer's intent — it must infer independence from the instruction stream. The runtime's register liveness map is derived from the manifest's declared channel types. The compiler knows exactly which registers hold live channel values across window boundaries. It names them directly and permanently. No renaming needed — the names were declared.
+
+The prefetcher exists because the hardware cannot know the access pattern ahead of time — it detects strides after the fact and speculates forward. The compiler knows every memory access the next circuit will make before that circuit's window opens, because the access pattern is declared in the manifest. The runtime issues exact prefetches during idle ticks. The prefetcher is not needed — the pattern was already known.
+
+Memory barriers exist because the hardware cannot know the programmer's ordering intent — it must be told explicitly when to stop reordering. The compiler proves ordering at window boundaries (Gathering) and via hardware signals (Non-Gathering). The ordering is a theorem. No barrier instruction is needed to assert what was already proved.
+
+The cache hierarchy — L1, L2, L3 — exists because the hardware cannot know the working set. It speculates with LRU eviction and hardware prefetch. The compiler declares every circuit's working set in the manifest and pins it to the correct tier before the circuit's first instruction. The cache does not need to discover the working set — it was told.
+
+**The pattern is always the same.** The hardware performs a function speculatively, generically, at runtime, with a statistical success rate, paying silicon area and power for the mechanism. The clock-aware kernel performs the same function provably, specifically, at compile time, with a 100% success rate, paying nothing at runtime. The hardware's mechanisms exist because the software never provided the information that would make them unnecessary. Declare the information, and the mechanisms dissolve — not because they are replaced by something better, but because the problem they were solving no longer exists.
+
+This is not an incremental optimisation. It is a transfer of responsibility from hardware to software — from the silicon's speculative engines to the compiler's proof system. The hardware that remains after this transfer has no wasted transistors. Every gate computes. Every cycle is declared. Every outcome was already known.
+
+---
 
 ### The Runtime Is the Scheduler
 
@@ -646,6 +678,10 @@ If the value's lifetime is `Task` or `Session`, it lives in L1 or L2 (pinned). T
 **Cross-core handoff — different cores, same or different dies.**
 
 The compiler reads the cache topology from `system.cap`: same L3 domain, different L3 domain, or NUMA. Each topology has a known coherency latency in ticks. The compiler adds a mandatory gap between the writer's window close and the reader's window open on the other core, equal to the coherency latency for that topology. The reader's window does not open until the data is guaranteed coherent. The handoff latency is a theorem in the dispatch table — not a runtime measurement, not a best-effort estimate, a verified tick count.
+
+**RAM-direct handoff — bypassing cache when the window budget allows.**
+
+For large `Permanent` or `Cold`-tier values — reference tables, ML weight tensors, bulk datasets — the cache hierarchy is not the right path. These values do not fit in L1 or L2. Normally this means cache pressure and eviction. In the clock-aware model, the compiler knows the declared size of every value and its tier. If a circuit's window budget is large enough to absorb DRAM latency directly — typically 100–300 ticks for a local DRAM access at declared physical address — the compiler routes the access directly to RAM, bypassing the cache hierarchy entirely. No cache line is brought in. No cache line is evicted to make room. The DRAM access is declared, timed, and absorbed in the window gap. Cache pollution from large cold reads is structurally impossible — the compiler never routes them through L1 in the first place. The cache is reserved for what is proven to be hot.
 
 **The system as a whole is a deeply pipelined machine.**
 
@@ -870,6 +906,43 @@ The implication for the hardware architecture is that the optimal core mix is **
 
 A conventional CPU cannot make this choice because it cannot prove which workloads are truly hot and which are cold — it must assume any core might need to run anything. The clock-aware model makes the distinction compile-time: every circuit declares its tier, its budget, its timing. The hardware can be matched to the workload structure that the compiler proved, not to a worst-case generalisation of it. Fewer hot transistors. More cold transistors. More work done. Less power consumed.
 
+### ARM Clock Domains — Mapping to the Tick System
+
+On ARM, the hardware exposes several distinct clock inputs that the runtime maps directly onto declared tick sources:
+
+| ARM clock signal | Purpose | Runtime mapping |
+|---|---|---|
+| `CLKIN` | Core clock — the fundamental execution tick | The base of every declared `@Timeslice` window. All cycle budgets are in `CLKIN` ticks. |
+| `CNTCLKEN` | Generic counter clock — drives `CNTVCT_EL0` (wall-clock counter) | The `ClockCircuit`'s `Channel<WallClock>` source. Frequency declared in `system.cap` as `cnt_freq_hz`. |
+| `ATCLKEN` | Trace clock — drives the ETM (Embedded Trace Macrocell) | The `ObservabilityCircuit`'s trace source. Must be synchronised to `CLKIN` for sub-cycle resolution. |
+| `ACLKEN` | AXI bus clock — drives the interconnect | The DMA descriptor ring clock. Declared in `system.cap`; compiler verifies DMA transfer timing against AXI clock ratio. |
+
+All four clocks are declared in `system.cap` with their frequencies and their relationships to `CLKIN`. The compiler derives tick-count equivalents for every timing annotation from these declared values. No clock frequency is assumed, guessed, or discovered at runtime. If any clock relationship is not declared, the compiler refuses to produce a binary.
+
+### Accelerator Coherency Port — Shared Memory Without CPU Involvement
+
+The ARM Accelerator Coherency Port (ACP) allows an accelerator — a GPU ALU array, a matmul unit, a DMA engine — to make coherent requests directly to the CPU's cache without involving the CPU. The accelerator reads or writes a cache line that the CPU has declared in its manifest, and the coherency protocol ensures the CPU sees a consistent view without a barrier instruction or a CPU-side flush.
+
+In the clock-aware model, ACP is the natural backing for cross-accelerator `Channel<T>` handoffs where the producer is a CPU circuit and the consumer is a declared accelerator circuit (or vice versa). The compiler, knowing both the CPU window and the accelerator's declared access window from `system.cap`, inserts the correct ACP coherency gap — derived from the ACP latency for the declared SoC — as a mandatory window-boundary constraint. The accelerator reads coherently from the CPU's L2, the CPU reads coherently from the accelerator's write buffer, and no software coherency management is needed. The handoff is proven at compile time. The ACP is the physical mechanism the runtime uses to execute that proof.
+
+### Core Power Modes — Runtime Lifecycle
+
+ARM cores expose a structured set of power modes. The runtime manages these as a first-class part of the dispatch loop, not as a side effect of OS idle logic:
+
+| Power state | ARM terminology | Runtime trigger | When used |
+|---|---|---|---|
+| On | Normal | Any circuit assigned to this core | Hot-path and cold-path execution |
+| Standby | `STANDBYWFI` / `STANDBYWFE` | No circuit assigned this window; wake event expected soon | Short idle gaps between windows; core wakes on next declared window tick |
+| Retention | `Ret` | No circuit assigned for N ticks; L1 state must be preserved | Gaps longer than a few windows where re-powering L1 would cost more than retention |
+| Dormant | Individual Core Shutdown | Core has no assigned circuits for the foreseeable dispatch horizon | Cold cores with no scheduled work; full power removal except for wake logic |
+| Off | Full off | Core removed from `system.cap` at runtime | Permanent removal; state not preserved |
+
+`STANDBYWFI` is the most common idle state. The runtime enters it at the end of a window when the dispatch table shows no circuit assigned for the immediately following window. The core halts execution and waits for an interrupt — in the clock-aware model, the only interrupt that fires is the hardware timer tick at the next declared window boundary. No spurious wakeup, no IRQ to classify, no scheduler to re-enter. The core wakes exactly when the next declared circuit is due, executes it, and returns to standby.
+
+`Dormant` mode is used for cold cores that the dispatch table shows unoccupied for many ticks ahead. The runtime transitions them to Dormant via the power controller declared in `system.cap`. The wake latency for Dormant is longer than for Standby — typically hundreds of ticks — so the runtime's lookahead must see a circuit arriving with enough lead time to wake the core before the window opens. This wake latency is declared in `system.cap` and the compiler accounts for it in the dispatch table: a cold core assigned a circuit must be woken at `window_start − wake_latency_ticks`. If the lookahead is insufficient, the compiler selects a different core or adjusts the window.
+
+The consequence is that the runtime's power consumption tracks the declared workload exactly. An idle system consumes only the power of the `ClockCircuit` and `ObservabilityCircuit` — everything else is in Standby or Dormant. A burst of hot-path circuits brings the required hot cores to On and leaves the cold cores in Dormant. The transition is provable from the dispatch table, not measured after the fact.
+
 ### The Runtime Adapts — AI-Regulated OS
 
 The atom stream, the ML execution planner, and the clock model assignment together form a system that adapts in real time to the actual workload — not by guessing, not by sampling, but by reading a hardware-sourced proof stream and acting on it within the constraints of the compiler's theorems.
@@ -1049,6 +1122,20 @@ The runtime maintains a **known key set** declared in `system.cap`. Only circuit
 The consequence is that the set of circuits permitted to execute on a given machine is a compile-time declaration, not a runtime policy. A circuit that is not signed by a key in `system.cap` cannot execute — not because a runtime check blocked it, but because the dispatch table has no slot for an unverified manifest. The attack surface is the key ring declaration, not the runtime policy engine.
 
 This extends the timing proof chain to a trust proof chain. The compiler proves timing. The signing key proves provenance. The runtime verifies both before admitting any circuit. The system's security posture is as strong as its weakest proof — and both proofs are compile-time artefacts.
+
+### The System Runs in Permanent Safe Mode
+
+Because every circuit that executes on the machine is cryptographically signed, the runtime operates in a state of continuous, verified trust. This has a consequence that is easy to understate: **every hardware security mechanism that exists to compensate for untrusted execution becomes unnecessary.**
+
+Privilege rings (ring 0 / ring 3) exist because the kernel cannot trust userspace code — it must prevent it from issuing privileged instructions. In the clock-aware model, every circuit that reaches the dispatch table was signed by a key in `system.cap`. Its instruction sequence is the exact sequence the compiler produced and the signing key certified. There is no untrusted userspace. Every circuit runs with the same trust level — full — because trust was established at compile time, not enforced at runtime through privilege separation.
+
+Spectre and Meltdown mitigations — retpoline, KPTI, IBRS, STIBP — exist because speculative execution crosses trust boundaries: the CPU speculates across a privilege boundary and leaks information through a timing side channel. There are no privilege boundaries in the clock-aware model. There is no speculative execution across boundaries because there are no boundaries. The mitigations address a problem that cannot be stated in this model.
+
+SMEP, SMAP, NX bits, W^X enforcement — these exist to prevent untrusted code from executing in privileged memory or privileged code from being tricked into executing attacker-controlled data. Every memory range in the clock-aware model is declared in a circuit manifest, pre-allocated by the runtime, and owned by a named, signed circuit. No range is writable and executable. No range is accessible from outside its declared owner. The address space is not partitioned by kernel policy — it is partitioned by the manifest, at compile time, before the system boots.
+
+ASLR exists to make memory layout unpredictable to an attacker who has already achieved code execution. In the clock-aware model, code execution requires a signed manifest. An attacker without the signing key cannot introduce a circuit. An attacker with the signing key is not an attacker — they are an authorised developer. ASLR randomises a layout that was never secret from the compiler; the clock-aware model makes the layout a compile-time theorem that is only ever executed by circuits that were proven correct before they ran.
+
+The system does not disable these mechanisms by policy. It renders them structurally irrelevant. The attack surface they address — untrusted code reaching the CPU — cannot be expressed in the clock-aware model. The signing key is the gate. The compiler is the certifier. The dispatch table is the enforcer. Everything that runs was already proven safe before it ran.
 
 **The invariant the compiler maintains:**
 
