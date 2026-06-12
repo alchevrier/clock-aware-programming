@@ -213,7 +213,7 @@ This is not a restriction. It is the observation that a timed function has no sh
 
 A timed function has a declared cycle budget. But control flow within that function may diverge: the main pipeline processes the common case, while other paths handle observability, error logging, metrics emission, or background maintenance. If those secondary paths run in the same cycle window as the hot path, they consume budget that the main pipeline needs.
 
-The type system detects this structurally. A path that uses a `cold<T>` type is automatically inferred as cold — the type carries the path annotation. The programmer may also declare it explicitly:
+The type system detects this structurally. A path that uses a `cold T` type is automatically inferred as cold — the type carries the path annotation. The programmer may also declare it explicitly:
 
 ```
 @Timeslice(core = 2, cycle = "4ns")
@@ -262,7 +262,7 @@ The `cold` block on a branch tells the compiler two things:
 1. **This path does not count against the hot path's declared budget.** The 4 ns budget is the budget for the `Ok` arm. The cold arm is allocated a separate, lower-priority window.
 2. **If this path's execution could delay the hot path, it is a compile error.** The compiler verifies that cold paths cannot block the cycle boundary of the hot path — they are structurally deferred, not merely hinted.
 
-Using a `cold<T>` type anywhere in a branch is sufficient for the inference — the programmer does not need to annotate every cold branch manually if the type already declares it. A `cold<Metric>` channel write is self-evidently not on the hot path; the compiler treats the entire branch as cold without an explicit `cold`.
+Using a `cold T` type anywhere in a branch is sufficient for the inference — the programmer does not need to annotate every cold branch manually if the type already declares it. A `cold Metric` channel write is self-evidently not on the hot path; the compiler treats the entire branch as cold without an explicit `cold`.
 
 This is what replaces `__builtin_expect` and `[[likely]]`/`[[unlikely]]` hints in C++. Those are hints the compiler may or may not respect. In the clock-aware model, path priority is a type-level property with a timing contract: the compiler proves the cold path cannot violate the hot path's budget, or rejects the programme. Observability, logging, and background maintenance become structurally isolated from the main pipeline — not by discipline, but by construction.
 

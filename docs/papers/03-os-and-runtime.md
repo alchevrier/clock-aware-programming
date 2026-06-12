@@ -823,7 +823,7 @@ A traditional filesystem bundles three distinct concerns: block I/O, caching, an
   ┌─────────────────────┐
   │   NamespaceCircuit  │
   │                     │
-  │  name ──► Cold<T>   │   reads/writes via NVMe driver circuit
+  │  name ──► cold T   │   reads/writes via NVMe driver circuit
   │           region    │──────────────────────────────────────►
   │           + offset  │
   │           + size    │
@@ -843,9 +843,9 @@ The `NamespaceCircuit` maps identifiers — circuit names, handoff keys, manifes
 | Journal / durability | `Cold` write-commit at clock boundary | NVMe driver circuit |
 | Namespace (paths, inodes) | `NamespaceCircuit` | OS circuit collection |
 | File locking | Channel ownership at clock boundary | Runtime ownership model |
-| `open` / `close` / `mmap` | `Cold<T>` channel subscription | Language type system |
+| `open` / `close` / `mmap` | `cold T` channel subscription | Language type system |
 
-There is no `VFS` layer. There is no `inode` table separate from the namespace. There is no `dentry` cache separate from the `permanent` tier. There is no `fsync` — the write-commit cycle boundary *is* the sync. A programme that holds a `Cold<T>` handle is subscribed to that region; when it drops the handle (removes the subscription), the runtime releases the region back to the `NamespaceCircuit`. There is no file descriptor table. There is no `open file description`. There is a typed channel subscription — the same primitive used for every other resource in the system.
+There is no `VFS` layer. There is no `inode` table separate from the namespace. There is no `dentry` cache separate from the `permanent` tier. There is no `fsync` — the write-commit cycle boundary *is* the sync. A programme that holds a `cold T` handle is subscribed to that region; when it drops the handle (removes the subscription), the runtime releases the region back to the `NamespaceCircuit`. There is no file descriptor table. There is no `open file description`. There is a typed channel subscription — the same primitive used for every other resource in the system.
 
 The filesystem was always a cache manager bolted on top of block I/O with a namespace on top. When the cache manager is the runtime, the block I/O is the driver circuit, and the namespace is one more OS circuit, the filesystem disappears as a concept — and what remains is simpler, faster, and fully verified by the same compiler that verifies everything else.
 
