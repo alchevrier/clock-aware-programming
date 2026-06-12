@@ -783,6 +783,75 @@ On ARM specifically, the ETM (Embedded Trace Macrocell) provides this at silicon
 
 The trace unit is also the input to PGO. Real execution traces from production replace synthetic profiles. The next compilation ingests the trace, adjusts instruction ordering and register allocation to match actual hotspots, and produces a binary that is provably better than the previous one — not heuristically better. The trace is a theorem input.
 
+### `@Measure` — Zero-Scaffolding Benchmarking
+
+Every circuit window already has a start tick and an end tick — the hardware counter values at window open and window close, read by the runtime as part of its normal dispatch-loop evaluation and recorded in the atom stream. `@Measure` is the annotation that names one of those measurements and declares that the `ObservabilityCircuit` should accumulate it into a rolling percentile distribution, exposed as a typed channel.
+
+```
+@Measure("parsePrice")
+circuit ParsePrice {
+    @Timeslice(core = 2, cycle = "4ns", budget = "3.5ns")
+    fn parse(frame: channel EthernetFrame) = ...
+}
+```
+
+That is the entire benchmark declaration. No benchmark harness. No warmup loop. No separate profiling binary. No external tooling. The annotation tells the compiler two things:
+
+1. **Name this measurement** — the string `"parsePrice"` becomes the key in the `ObservabilityCircuit`'s measurement registry.
+2. **Generate a percentile channel** — the compiler produces `channel ParsePriceMeasurement` automatically, backed in the `session` tier. The `ObservabilityCircuit` writes to it at its declared low-frequency window.
+
+The generated channel element contains the full distribution:
+
+```
+channel ParsePriceMeasurement {
+    val element = Measurement   // { p50, p90, p99, p999, p9999, max, min, count }
+    val tier    = session
+}
+```
+
+Reading percentiles requires no scaffolding:
+
+```
+val m = ParsePriceMeasurement.get()
+// m.p99   — 99th-percentile execution time in CLKIN ticks
+// m.p9999 — 99.99th-percentile
+// m.count — executions accumulated in this distribution window
+```
+
+You run the code — in production, on real data, under real load — and you read the channel. There is no synthetic harness, no warmup phase, no separate measurement binary. The measurement is the programme.
+
+**Why this is categorically different from conventional benchmarking.**
+
+A conventional benchmark runs synthetic workloads in isolation under controlled conditions, with a warmup phase to prime the cache. It measures a proxy for production behaviour. The proxy is imprecise because the cache state at benchmark start differs from production, the data is synthetic rather than real, and the benchmark harness's own instruction mix appears in the measurement window. The result is a number that approximates production timing but cannot be the same thing.
+
+`@Measure` measures production execution. The circuit is already running in its declared window, against real inputs, with its working set already pinned to L1 by the runtime before its first instruction. The start and end `CLKIN` ticks are read by the runtime as part of normal dispatch-loop EVALUATE — the measurement adds zero overhead to the circuit's own budget. The `ObservabilityCircuit` accumulates the deltas in its own declared window, isolated from the hot path. The percentile distribution is over every actual production execution, not over a synthetic proxy.
+
+The percentile calculation is exact, not sampled. Every atom produces a `TraceEvent` with its actual tick delta. The `ObservabilityCircuit` accumulates every delta into a declared-size histogram (`permanent` tier) and computes percentiles at its declared low-frequency cycle. The p99 you read from `ParsePriceMeasurement` is the true 99th percentile of every execution since the measurement window opened — not a statistical estimate over a sample, not a best-of-N over warmup runs.
+
+**Intra-window checkpoints.** If the full-window distribution is insufficient and you need to locate where within a window the time is spent:
+
+```
+fn parse(frame: channel EthernetFrame) = {
+    val header  = parseHeader(frame)
+    @Checkpoint("headerParsed")
+    val decoded = decodePayload(header)
+    @Checkpoint("payloadDecoded")
+    val price   = extractPrice(decoded)
+    price
+}
+```
+
+Each `@Checkpoint` annotation inserts a single `CNTVCT_EL0` (or `RDTSC`) read at that point in the instruction sequence. The compiler includes the cost of that read — one instruction — in the budget analysis. The checkpoint emits a delta to `channel ParsePriceCheckpoints`, a structured stream with one entry per label per execution. The `ObservabilityCircuit` accumulates checkpoint deltas into per-label distributions alongside the full-window distribution. The result: you know not just that p99 of `parsePrice` is 3.1 ns, but that 2.4 ns of it is in `headerParsed` and 0.7 ns is in `payloadDecoded` — from production data, with no profiler, no instrumented build, no loss of fidelity.
+
+**Measurement channels are first-class subscribers.** Any declared circuit can subscribe to a measurement channel. An alert circuit can declare:
+
+```
+@Alert(channel = ParsePriceMeasurement, condition = "p99 > budget * 0.9")
+circuit ParsePriceAlert { ... }
+```
+
+This fires a `channel AlertSignal` if the p99 crosses 90% of the declared budget — before any violation occurs. The alert circuit runs in its own declared window, reads the measurement channel written by the `ObservabilityCircuit`, and emits the signal through the normal channel mechanism. No polling. No external monitoring system. No Prometheus scrape interval. The measurement is in the system. The alert is in the system. The channel is the interface.
+
 ---
 
 ## Memory
