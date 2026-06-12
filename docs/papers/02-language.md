@@ -356,21 +356,28 @@ There is no separate collection model. There is no separate channel model. There
 
 The compiler sees one construct. The hardware sees one thing: a stride into a contiguous array.
 
-**Every standard library function declares its own cycle budget.** This is mandatory — a stdlib function without a declared `@Timeslice` does not compile into the standard library. The declaration is per-target: `put` on `channel FlatMap` against a Skylake target at 4 GHz costs a different number of cycles than the same call against a Cortex-A72. The stdlib ships a budget table per supported target, derived from the same ALU cost model the compiler uses.
+**The compiler derives `put`/`get` costs — no budget table needed.** Because every channel declaration includes `element`, `tier`, and `size`, the compiler has everything it needs to compute the exact cycle cost of `put` and `get` from first principles:
 
-When the programmer calls a stdlib function inside a timed `fn`, the compiler substitutes the stdlib function's declared budget for the target into the caller's accumulated cycle count. The programmer does not need to look up the cost manually — the compiler propagates it:
+- `tier` → cache level → access latency (from `system.cap`)
+- `element` → element width → stride width
+- `size` → working set footprint → whether it fits in the declared tier
+- `writeAccessPattern` / `readAccessPattern` → index arithmetic → instruction count
+
+The cost is not looked up in a pre-shipped budget table. It is derived — the same way the compiler derives the cost of any other instruction sequence — from the ALU cost model in `system.cap` applied to the concrete element size, tier latency, and access pattern arithmetic. Every `put` and `get` call site gets a precise cycle count, specific to the channel it operates on. A `put` into a `task`-tier channel of 64-byte elements costs a different number of cycles than a `put` into an `ephemeral`-tier channel of 8-byte elements — and the compiler knows both without the programmer declaring either.
+
+When the compiler accumulates the cycle budget for a timed `fn`, it substitutes the derived cost for each channel operation at the call site:
 
 ```
 fn parsePrice — @Timeslice(cycle = 4ns) — target: skylake-4ghz
 
-  operation                       source    cycles
-  ──────────────────────────────  ────────  ──────
-  channel.get()                   stdlib     1
+  operation                       tier       cycles (derived)
+  ──────────────────────────────  ─────────  ────────────────
+  in.get(consumerIndex)           task       1    ← L1 hit, 8-byte element, stride 1
   status field extract            ALU        1
-  FlatMap.get(symbol)             stdlib     3     ← binary search, 1024 elements
+  priceTable.get(symbol)          task       3    ← L1 hit, binary search, 1024 × 8B
   extract(msg)                    ALU        3
-  channel.of()                    stdlib     1
-                                            ──────
+  channel.of(price)               task       1    ← L1 store
+                                                  ──────
   hot path total                             9 cycles  →  2.25 ns @ 4 GHz
 
   declared budget: 4 ns (16 cycles)
@@ -378,9 +385,9 @@ fn parsePrice — @Timeslice(cycle = 4ns) — target: skylake-4ghz
   margin:          7 cycles  ✓
 ```
 
-The stdlib budget entries are labelled `stdlib` in the compiler's output — distinct from user ALU operations — so the programmer can see exactly which stdlib calls dominate their budget and replace them with cheaper alternatives if needed.
+The compiler's output labels each channel operation with its tier, so the programmer can see at a glance which operations are L1-resident, which cross a tier boundary, and by how much their costs dominate the budget.
 
-This has a second consequence: the standard library cannot contain a function whose worst-case cost is unbounded. A function whose cycle count depends on runtime input size — a sort, a full linear scan, an unbounded iteration — cannot be declared with a fixed budget and therefore cannot be in the stdlib. The stdlib is, by construction, a collection of functions with statically-bounded costs. Unbounded operations must be expressed as circuits with declared windows and explicit `cold` deferred paths, not as stdlib calls on the hot path.
+The consequence is that no channel operation can have an unbounded cost. Every access pattern is a pure function from key to index — branch-free, allocation-free, with a statically-known instruction count. Every tier has a declared latency in `system.cap`. Every footprint is checked at compile time. The cost of `put` and `get` is always a theorem, never an estimate. Unbounded operations — sorts, full linear scans, unbounded iterations — cannot be expressed as channel access patterns and therefore cannot appear on the hot path.
 
 ### A Circuit Is a Clocked Block — No Classes
 
