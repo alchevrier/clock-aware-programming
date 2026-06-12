@@ -752,6 +752,44 @@ The two-question memory manager:
 
 Every GC algorithm ever invented — generational, concurrent, incremental, ZGC, Shenandoah — is a runtime approximation of this two-question circuit. The approximation exists because the GC does not know the mutator's timing. Declare the timing and the approximation becomes unnecessary.
 
+### No Stack, No Heap — One Flat Physical Address Space
+
+A conventional programme has two memory regions the programmer reasons about separately: the stack (implicit, automatic, scoped to call depth) and the heap (explicit, dynamic, allocated and freed on demand). Both exist because the runtime has no prior knowledge of what the programme will need — the stack grows as calls deepen, the heap grows as allocations are requested. Neither region's size is declared in advance. Both are reactive.
+
+In the clock-aware model, neither exists as a concept. There is one flat physical address space, partitioned at compile time into declared regions, each owned by a declared circuit for a declared lifetime. The compiler produces this partition from the manifests of all slotted circuits. The runtime loads it before the first window opens. It does not change at runtime. The region boundaries are physical addresses — not virtual ranges managed through a page table, not stack frames managed through a stack pointer, but fixed locations in DRAM assigned once and pinned.
+
+```
+  Physical address space (determined at compile time from all manifests)
+
+  0x0000_0000  ─────────────────────────────────────
+               runtime tables (dispatch, manifest, key ring)
+  0x0010_0000  ─────────────────────────────────────
+               DMA regions — NIC RX ring, NIC TX ring
+               NicCircuit writes here; no CPU involvement
+  0x0020_0000  ─────────────────────────────────────
+               channel EthernetFrame (PacketProcessor subscriber)
+               declared size = 64 × sizeof(Frame)
+  0x0030_0000  ─────────────────────────────────────
+               PacketProcessor task tier
+               declared size = 128B, window scope
+  0x0040_0000  ─────────────────────────────────────
+               OrderBook session tier
+               declared size = 10MB, circuit lifetime
+  ...          ─────────────────────────────────────
+               cold tier — NVMe-backed, demand-loaded
+  ─────────────────────────────────────────────────
+```
+
+Every device knows exactly where to write its data. The NIC's DMA descriptor ring points to the physical address of `channel EthernetFrame` — a fixed address, declared in the manifest, wired into the DMA descriptor at slot time. When the NIC's DREQ asserts, the DMA controller writes directly into that address. No CPU instruction. No interrupt. No buffer copy. The data arrives at the physical address the subscriber will read from, because that address was declared before the first packet arrived.
+
+The subscriber — `PacketProcessor` — knows the same address. Its manifest declares `channel EthernetFrame` as an input, and the compiler resolves the physical base address at build time. When `PacketProcessor`'s window opens, its first instruction fetches from a known physical address that the hardware prefetcher has already been instructed to load — because the runtime, during the preceding IDLE tick, issued the prefetch against that exact address, knowing from the dispatch table that `PacketProcessor` would need it.
+
+This is what makes prefetching exact rather than speculative. A conventional hardware prefetcher observes past access patterns and guesses future ones — it is correct when the access pattern is regular, wrong when it is not. The runtime knows the next circuit's entire memory footprint before that circuit's window opens, because the footprint is in the manifest. It does not guess. It reads the manifest entry for the upcoming circuit, finds the physical addresses of its declared channels and tier values, and issues prefetches against those exact addresses during the idle ticks immediately before the window opens. The prefetch is a theorem execution, not a statistical inference.
+
+The same flat address space is what makes instruction scheduling exact. The compiler, knowing the physical address of every value a circuit will access, can arrange the circuit's instruction sequence to maximise pipeline utilisation against the specific cache set layout of those addresses. Cache set conflicts — two values that hash to the same cache set and evict each other — are detected at compile time by computing `address mod (cache_sets × cache_line_size)` for every declared value and checking for collisions. If a collision exists, the compiler adjusts the physical placement of one of the values (widening a tier region by a cache line) until the conflict is resolved. This analysis is possible only with physical addresses. Virtual addresses, with their page-table indirection, do not allow the compiler to know which cache set a value occupies.
+
+The consequence is a complete inversion of the conventional memory model. In a conventional system, the programme declares what it wants to do and the runtime figures out where to put things. In the clock-aware model, the compiler decides where everything goes, the runtime pre-positions it, and the programme executes against a memory layout that was optimised before the first instruction ran. The programme does not manage memory. It declares what it needs. The compiler and runtime do the rest — once, at build and slot time, never again at execution time.
+
 ### The Runtime Is the Sole Memory Provider
 
 No circuit allocates memory. No circuit calls `malloc`. No circuit holds a pointer to an allocator. The runtime is the only entity in the system that provides memory — and it does so exclusively by serving declared lifetime types from the correct tier.
