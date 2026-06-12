@@ -461,33 +461,35 @@ A driver is a circuit with a declared channel interface. Two structural kinds:
 
 A driver declares its channels, its timing constraints, and its DMA configuration. The compiler resolves the DMA ring buffer, the DREQ line, and the interrupt vector from the device descriptor in `system.cap`. The driver programmer writes `channel UartFrame` — the compiler wires the UART DREQ to the DMA controller and delivers completed frames to the channel at the declared cycle. No manual DMA ring setup. No interrupt registration. No `request_irq`. No `dma_alloc_coherent`.
 
-### A Device Is a Class — A Stateful Circuit with Declared Signal Access
+### A Device Is a Circuit with Declared Signal Access
 
-A device is more precisely a `class` — a stateful circuit whose register file is the device's internal state, and whose input and output ports are accessible to the kernel via declared signals. Three device kinds:
+A device is a `circuit` — stateful, clocked, with its register file backed by the device's internal state. Its input and output ports are declared channels; its readiness is declared as a `Signal`. Three device kinds:
 
 ```
-class ReadOnlyDevice<T> {
+circuit ReadOnlyDevice {
     // Device produces data. Kernel reads.
     // Input: hardware DREQ signal — is data ready?
-    // Output: channel T — the data, delivered when DREQ asserts
-    val ready: Signal   // DREQ line — compiler monitors this
-    val out:   channel T
+    // Output: declared channel — delivered when DREQ asserts
+    val element = Byte           // concrete element type, declared per device
+    val ready:   Signal          // DREQ line — compiler monitors this
+    val out:     channel Frame   // concrete channel, named per device
 }
 
-class WriteOnlyDevice<T> {
+circuit WriteOnlyDevice {
     // Kernel sends data. Device consumes.
-    // Input: channel T — data to send
+    // Input: declared channel — data to send
     // Output: hardware accept signal — is the device ready to receive?
-    val accept: Signal  // device's write-ready line
-    val in:     channel T
+    val element = Sample         // concrete element type
+    val accept:  Signal          // device's write-ready line
+    val in:      channel Sample  // concrete channel
 }
 
-class ReadWriteDevice<In, Out> {
+circuit ReadWriteDevice {
     // Full-duplex. Both directions, independent signals.
-    val ready:  Signal       // DREQ: device has data for kernel
-    val accept: Signal       // device ready to receive from kernel
-    val in:     channel In
-    val out:    channel Out
+    val ready:  Signal        // DREQ: device has data for kernel
+    val accept: Signal        // device ready to receive from kernel
+    val in:     channel Command   // concrete: what the kernel sends
+    val out:    channel Response  // concrete: what the device returns
 }
 ```
 
@@ -535,7 +537,7 @@ In the ARM memory model, **Gathering** means the hardware may merge multiple acc
 
 **Software-timed (Gathering) resources** are scheduled by the compiler. The hardware may merge and reorder accesses within a window because the compiler has already proved the ordering is safe across window boundaries. No barrier instruction is needed — the window boundary is the ordering proof.
 
-**Hardware-timed (Non-Gathering) resources** are driven by the DREQ signal. The compiler wires the signal to the DMA trigger at build time. The CPU never touches the hot path. Non-Gathering semantics are the default for `WriteOnlyDevice<T>` and `ReadOnlyDevice<T>` channel mappings — the compiler emits the correct memory attribute in the physical address mapping and the DMA descriptor, so the hardware enforces ordering without any runtime instruction from the CPU.
+**Hardware-timed (Non-Gathering) resources** are driven by the DREQ signal. The compiler wires the signal to the DMA trigger at build time. The CPU never touches the hot path. Non-Gathering semantics are the default for `ReadWriteDevice` and `ReadOnlyDevice` channel mappings — the compiler emits the correct memory attribute in the physical address mapping and the DMA descriptor, so the hardware enforces ordering without any runtime instruction from the CPU.
 
 The consequence: `dmb` / `dsb` / `isb` memory barrier instructions are absent from the hot path. A barrier is a runtime signal that the programmer could not express the ordering statically. In the clock-aware model, the ordering is declared — Gathering resources via the window boundary, Non-Gathering resources via the hardware signal. The compiler proves both. No barrier is necessary.
 
