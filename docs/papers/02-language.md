@@ -111,7 +111,7 @@ The clock-aware model closes the gap by making the connection at compile time. T
 
 The language surface is Java-like in familiarity but Kotlin-like in concision: `fn` for functions, return types inferred, `val` for immutable bindings. No `void`. No explicit `return` for single-expression functions. Learnable in days.
 
-The language has eleven reserved lowercase keywords that define the computational model. Everything else is a name the programmer chooses:
+The language has twelve reserved lowercase keywords that define the computational model. Everything else is a name the programmer chooses:
 
 | Keyword | What it declares |
 |---|---|
@@ -119,6 +119,7 @@ The language has eleven reserved lowercase keywords that define the computationa
 | `circuit` | A stateful clocked block with self-feeding internal channels. The fundamental organisational primitive. Not a class. Not an object. |
 | `channel` | A typed data flow path — between circuits, or inside a circuit as self-feeding state. The only persistence mechanism. |
 | `clock` | A hardware clock source, declared by name. All timing annotations resolve against a declared `clock`. |
+| `val` | An immutable binding. Values do not change after declaration; data flow is forward-only. |
 | `register` | Lifetime tier: CPU register file. Expires at expression boundary. Never touches memory. |
 | `ephemeral` | Lifetime tier: L1 cache, pinned. Function scope. Intermediate results, parsing scratch, message buffers. |
 | `task` | Lifetime tier: L1/L2 cache, pinned for the current cycle window. Active transaction state, channel read buffers. |
@@ -127,7 +128,7 @@ The language has eleven reserved lowercase keywords that define the computationa
 | `memory` | Qualifier: in-core memory (covers `ephemeral`, `task`, `session`, `permanent`). Used when the tier is inferred from scope. |
 | `cold` | Lifetime tier: NVMe / off-core storage. Demand-loaded, declared access window. |
 
-There are no other primitive concepts. Every construct in the language is built from these eleven reserved words.
+There are no other primitive concepts. Every construct in the language is built from these twelve reserved words.
 
 A `fn` is combinational logic — the gate, not the flip-flop. Its output is a signal — the value the function produces. That signal is the return value, not a parameter. There is no output wire passed as input:
 
@@ -243,7 +244,7 @@ Circuit equivalent:
                          │             │            │ Malformed            │
                          │             │            ├──────────────────────┼──► cold deferred
                          │             │            │  metrics.put()       │    (separate window,
-                         │             │            │  Channel.empty()     │     not in budget)
+                         │             │            │  channel.empty()     │     not in budget)
                          │             │            │                      │
                          │             │            │ default              │
                          │             │            ├──────► ignore        │
@@ -398,8 +399,8 @@ A `circuit` is a stateful clocked block. Its state is declared as internal `chan
 ```
 @Timeslice(core = 2, cycle = "4ns")
 circuit OrderBook {
-    channel PriceTable bids: memory    // internal channel — self-feeding state across clock boundaries
-    channel PriceTable asks: memory
+    channel PriceTable bids: session    // internal channel — self-feeding state, circuit lifetime
+    channel PriceTable asks: session
 
     fn update(in: channel Fill): channel BookSnapshot =
         snapshot(apply(in.get(consumerIndex), bids, asks))   // ALU: read state, transform, emit signal
@@ -440,7 +441,7 @@ A `circuit` may also **return an internal channel** as its output signal — the
 
 ```
 circuit BestBidTracker {
-    channel Price best: memory   // self-feeding AND returned as output
+    channel Price best: session   // self-feeding AND returned as output
 
     fn track(in: channel Fill): channel Price {
         val candidate = in.get(consumerIndex).price
@@ -454,7 +455,7 @@ Here `best` is both the circuit's internal state and its output signal. Each inv
 
 The `update()` and `bestBid()` functions are the circuit's ALU — combinational logic that takes the current state channel and an input signal and produces an output signal. The `@Timeslice` annotation is the timing constraint on the critical path through that logic, exactly as a timing constraint in Vivado applies to the critical path through a clocked block.
 
-This is not a metaphor. A hardware D flip-flop holds a value across a clock edge. An internal `channel: memory` holds a value across a clock boundary. A hardware ALU computes a result in one cycle from registered inputs. A timed `fn` computes a result within its declared budget from declared-tier channel inputs. The correspondence is structural.
+This is not a metaphor. A hardware D flip-flop holds a value across a clock edge. An internal `channel: session` holds a value across a clock boundary for the circuit's lifetime. A hardware ALU computes a result in one cycle from registered inputs. A timed `fn` computes a result within its declared budget from declared-tier channel inputs. The correspondence is structural.
 
 The system is a netlist: each `circuit` is a clocked block, each `fn` call is a wire connecting output signals to input ports, each `channel` is a registered signal crossing a clock boundary. The compiler is the synthesis tool. `system.cap` is the constraint file. The binary is the bitstream.
 
