@@ -524,6 +524,21 @@ driver.Uart0.permits = [SerialLogger, DebugMonitor]
 
 This is the permission model. Not a syscall table. Not a capability token. Not a privilege ring. A channel subscription, declared in `system.cap`, verified by the compiler at build time. A circuit that attempts to read a channel not listed in its subscription declaration is a compile error. The permission check is not a runtime gate — it is a proof obligation discharged at compile time.
 
+### Gathering and Non-Gathering Resources
+
+In the ARM memory model, **Gathering** means the hardware may merge multiple accesses to the same address into one bus transaction. **Non-Gathering** (device memory attribute, `nGnRnE`) means no merging, no reordering, no speculation — every access reaches the physical device register in declared order. This distinction maps directly onto the clock-aware resource model:
+
+| Resource type | ARM attribute | Timing mechanism | Who enforces order |
+|---|---|---|---|
+| Normal memory, `Channel<T>` buffers, declared tiers | Gathering | Software-timed (window boundary) | Compiler |
+| Device registers, MMIO, DMA descriptor rings | Non-Gathering (`nGnRnE`) | Hardware-timed (DREQ signal) | Hardware |
+
+**Software-timed (Gathering) resources** are scheduled by the compiler. The hardware may merge and reorder accesses within a window because the compiler has already proved the ordering is safe across window boundaries. No barrier instruction is needed — the window boundary is the ordering proof.
+
+**Hardware-timed (Non-Gathering) resources** are driven by the DREQ signal. The compiler wires the signal to the DMA trigger at build time. The CPU never touches the hot path. Non-Gathering semantics are the default for `WriteOnlyDevice<T>` and `ReadOnlyDevice<T>` channel mappings — the compiler emits the correct memory attribute in the physical address mapping and the DMA descriptor, so the hardware enforces ordering without any runtime instruction from the CPU.
+
+The consequence: `dmb` / `dsb` / `isb` memory barrier instructions are absent from the hot path. A barrier is a runtime signal that the programmer could not express the ordering statically. In the clock-aware model, the ordering is declared — Gathering resources via the window boundary, Non-Gathering resources via the hardware signal. The compiler proves both. No barrier is necessary.
+
 ---
 
 ## Execution
@@ -531,6 +546,28 @@ This is the permission model. Not a syscall table. Not a capability token. Not a
 ### The Runtime Is the Scheduler
 
 The scheduler exists to resolve contention between tasks whose timing is unknown. In a clock-aware system, there is no such contention — every function's window is declared non-overlapping. There is nothing to arbitrate. The "scheduler" in this model is the clock itself: functions execute at their declared cycles, in order, because the CPU executes the next instruction. No arbitration. No priority queue. No run queue. No preemption. The cycle annotation is the schedule; the hardware is the scheduler.
+
+### The Runtime Dispatch Loop — A Finite State Machine
+
+The runtime's dispatch loop is a finite state machine. Four states repeat every declared clock window:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                                                                 │
+│   IDLE ──► PLAN ──► EXECUTE ──► EVALUATE ──► IDLE (repeat)     │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**IDLE — No pending signals.** The runtime does not spin. It uses idle ticks productively: organising the instruction sequence for the next window, speculating ahead in the dispatch table, pre-conditioning the `cpu_model` frequency for a declared burst, and managing cores with no assigned circuit this window — powering them down, assigning them cold-tier work, or pre-warming their caches ahead of the next declared hot-path entry.
+
+**PLAN — Signals present.** The runtime reads the dispatch table for the current tick. Which circuits fire this window? Can all declared channels be served? Are the circuits on HOT or COLD paths — determined from the trace history of previous executions, not from runtime guessing? What was the previous execution's actual cycle delta versus its declared budget? Which `cpu_model` applies to this core? The plan is not computed at this point — it was compiled. The runtime reads a static structure, not a dynamic queue.
+
+**EXECUTE — Circuits run.** The CPU executes the declared instruction sequence within the declared window. The runtime observes via the trace unit. It does not intervene.
+
+**EVALUATE — Window closes.** The runtime reads the actual cycle count from the trace unit, computes the delta against the declared budget, and writes it to the observability channel. If the delta is consistently trending toward the budget ceiling, a pre-warning signal is emitted before any violation occurs. Clock model adjustments — frequency pre-conditioning for an upcoming declared burst — are applied here, ahead of the burst, using the dispatch table lookahead. Not reactively during the burst. Before it.
+
+The FSM has no transitions that go from EXECUTE back to PLAN mid-window. A circuit that exceeds its declared budget is a compile-time impossibility — if it compiled, the compiler proved it fits. The FSM is deterministic by construction.
 
 ### How Cycles Work: What the Compiler Solves
 
@@ -625,6 +662,12 @@ This is what Vivado does with FPGA timing constraints: it solves for register-to
 
 The CPU's own hardware pipeline — out-of-order execution, store forwarding, prefetcher — runs inside each window, invisible to the compiler. The compiler's pipeline runs across windows. Two levels of pipelining, both proven, both counted.
 
+### Register Forwarding and the Multi-Stack Pipeline
+
+The runtime tracks register file state across window boundaries. When a circuit completes its window, the runtime records which registers hold live values — values that the next circuit on the same core declares as inputs. Those registers are not clobbered between windows. The next circuit's first instruction reads directly from the register the previous circuit's last instruction wrote to — no store, no load, no memory traffic. This is **software register forwarding**: the runtime maintains a per-core register liveness map, derived from the manifest's declared channel types, and the compiler emits instruction sequences that assume the forwarded register state is already present. Register-lifetime handoffs cost zero cycles not by coincidence but by construction.
+
+Each circuit executes on its own declared stack — not the hardware stack. The hardware stack pointer (`SP`) is reserved exclusively for the runtime's dispatch loop itself: a fixed, small, runtime-only stack that never grows during normal circuit execution. Every circuit has a declared stack region in its manifest, pre-allocated in the `Task` tier (L1/L2 pinned) before the circuit's first window opens. The runtime maintains a **multi-stack pipeline**: each slot in the dispatch table has its own base pointer into its pre-allocated stack region. Switching between circuits requires no register-save/restore — the next circuit's registers are already known from the forwarding map, and its stack is already present in L1. A circuit transition costs exactly the ticks between window boundaries. Nothing more.
+
 ### The Trace Unit — Proving the Compiler Was Right
 
 On ARM (and equivalent architectures), the trace unit timestamps every instruction as it commits. The clock-aware runtime subscribes to the trace unit's output as a `Channel<TraceEvent>` through the `ObservabilityCircuit`. This gives the system something no conventional OS has ever had: a continuous, hardware-sourced, instruction-level audit of every circuit's actual execution.
@@ -663,6 +706,8 @@ The trace unit is also the input to PGO. Real execution traces from production r
 
 Memory management is determined by lifetime types, which are determined by cycle annotations. The compiler knows at build time which memory tier every value lives in and when it expires. At the cycle boundary, memory is reclaimed automatically, without a single runtime instruction dedicated to collection.
 
+The runtime operates exclusively on **physical addresses**. There are no virtual addresses in the hot path. No page table walks. No TLB lookups. No TLB shootdowns. Every memory region used by every circuit is declared in the manifest with its physical base address and size, pre-allocated at slot time, and pinned for the duration of the circuit's declared lifetime. The runtime tracks memory handoffs — which circuit owns which range at which tick — directly in the manifest record. This eliminates indirection entirely: the compiler knows the exact cache set and cache way each physical address maps to (given the cache size and associativity declared in `system.cap`), so it can arrange memory instructions to avoid set conflicts at the instruction level, not just at the allocation level. Physical addressing makes memory instruction scheduling deterministic. Virtual addressing, with its TLB interposition, does not.
+
 The two-question memory manager:
 1. Did the function request allocation this cycle? → serve from the declared tier.
 2. Did the function finish this cycle? → reclaim its entire working set.
@@ -693,6 +738,10 @@ For `Session` values — cross-circuit handoffs like `riskLimits` — reclaim ha
 This is why the runtime must be the sole provider. A circuit that allocated its own memory would hold a range the runtime does not know about. The runtime could not reclaim it at circuit removal without scanning — which requires knowing where to scan, which requires the circuit to have declared it. The declaration is the allocation. The allocation is the declaration. The runtime holds both ends of the same fact.
 
 The programmer never sees this. They declare `Session<RiskLimitTable>` and write to it. The runtime provided the memory before the first write. The runtime reclaims it after the last read. The circuit never held a pointer to an allocator, never called a destructor, never decremented a reference count. The lifecycle is not managed — it is declared. The runtime executes the declaration.
+
+### Unaligned Cache Lines — Compile-Time Padding
+
+The compiler detects structs whose declared fields would span a cache line boundary and automatically regroups and pads them to alignment. This is not a hint or a warning — it is a compile-time transformation. The compiler reads the `cpu_model`'s cache line size from `system.cap` (64 bytes on x86/ARM, 128 bytes on some POWER configurations) and arranges struct fields so that no single value straddles two cache lines. Values that would straddle are either reordered (where the reorder is semantics-preserving for the declared lifetime type) or padded with explicit fill bytes. The padded layout is emitted into the manifest alongside the circuit's memory footprint declaration. The runtime uses the padded layout for pre-allocation and for the DMA descriptor — hardware and software see the same physical layout. A struct that arrives from a network DMA with a misaligned layout is a compile error: the incoming `Channel<T>` type's layout must match the circuit's declared type exactly, and layout is part of the type.
 
 ### Out of Memory Is a Circuit Removal Event
 
@@ -1034,6 +1083,8 @@ while (!dmaDone()) {}           // more polling
 ```
 
 After understanding DREQ: set the PERMAP register to the peripheral's DREQ number, arm the DMA once, and the hardware paces itself forever. Zero CPU involvement on the hot path. Hundreds of lines of driver code replaced by one 5-bit field in a register — because the peripheral was already declaring its timing. The driver writer just was not listening to it.
+
+On ARM, the runtime can issue `PRFM` (Prefetch Memory) and `RPRFM` (Range Prefetch Memory, SVE2) instructions to pre-warm a circuit's working set before its window opens. During an IDLE tick — when the current core has no circuit assigned — the runtime uses the dispatch table lookahead to identify which circuit fires next and issues a range prefetch for its declared `Task`-tier working set. On the hot path, this is redundant: the speculative pre-conditioning mechanism already ensures the working set is in L1 before the window opens. `RPRFM` is most valuable for the **first dispatch of a cold circuit** that has not yet had its working set promoted: the runtime issues the prefetch during the preceding idle window, so the circuit's first execution does not pay a cold-cache penalty. After the first execution, the working set is pinned in L1 and prefetch instructions are unnecessary — the data is already there, declared to be there, proven to be there.
 
 The clock-aware channel model makes this structural. An SPI sensor becomes:
 
