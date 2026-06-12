@@ -23,7 +23,7 @@ Clock-aware programming declares the timing. The compensation becomes unnecessar
 
 ---
 
-## Three Consequences
+## Four Consequences
 
 ### I. Clock-Aware Programming
 
@@ -33,18 +33,21 @@ The same insight that makes FPGAs deterministic — the clock as global synchron
 
 → **[Paper I: Clock-Aware Programming](docs/papers/01-clock-aware-programming.md)**
 
-The core primitive, the key claims, the implementation path (Rust + proc-macro + `system.cap`), and the hardest objection. This is the working paper — implementation decisions are in the ADRs.
+The core primitive, the key claims, the implementation path (Rust + proc-macro + `system.cap`), and the hardest objection. Covers: CPU partition model, channel subscriptions, the FPGA parallel, irregular workloads, and why every production system already declares the bounds required.
 
 ---
 
 ### II. The Language
 
-A language with four rules instead of four thousand pages — designed from the declarations down, not from a syntax up. No unsafe. No barriers. No move semantics. No GC. If it compiles, it is hardware-correct.
+A language with four rules instead of four thousand pages — designed from the declarations down, not from a syntax up. Twelve reserved lowercase keywords. No unsafe. No barriers. No move semantics. No GC. No generics. No type parameters. If it compiles, it is hardware-correct.
 
 - **Four rules** — clock annotation, lifetime type, channel, exhaustive match. Complete. No fifth rule.
-- **A function is a circuit** — its output is a return value (a signal), not a parameter. Composition is function application.
-- **A class is a circuit with an ALU** — state is a register file, methods are combinational logic, timing is declared.
-- **One guarantee** — if it compiles, it is hardware-correct. Not by convention. By construction.
+- **Twelve keywords** — `fn`, `circuit`, `channel`, `clock`, `val`, `register`, `ephemeral`, `task`, `session`, `permanent`, `memory`, `cold`. Every construct in the language is built from these.
+- **`fn` is combinational logic** — output is a return value (a signal), not a parameter. Composition is function application.
+- **`circuit` is a clocked block** — internal state declared as self-feeding `channel` entries. The flip-flop model, not OOP.
+- **`channel` is the only data primitive** — typed, sized, tiered, with declared access patterns. Ring buffers, queues, stacks, lookup tables: all `channel` declarations. No separate collection model.
+- **Compiler derives all costs** — `element` + `tier` + `size` on every channel declaration gives the compiler exact `put`/`get` cycle cost from first principles. No estimates, no budget tables, no profiling required.
+- **Designed for AI authorship** — four rules fit in any context window. The compiler is the sole correctness gatekeeper. No human code review required for safety-critical properties.
 
 → **[Paper II: The Language](docs/papers/02-language.md)**
 
@@ -52,11 +55,17 @@ A language with four rules instead of four thousand pages — designed from the 
 
 ### III. The OS and Runtime
 
-When the OS is written in the same language, the runtime and kernel converge. The scheduler, memory manager, driver model, permission system, and deployment model all dissolve into the same four rules. Running a program is adding a circuit. Booting is adding the OS circuit. Exceptions are signals on declared channels.
+When the OS is written in the same language, the runtime and kernel converge. The scheduler, memory manager, driver model, permission system, filesystem, and deployment model all dissolve into the same four rules. Running a program is adding a circuit. Booting is adding the OS circuit. Exceptions are signals on declared channels.
 
-- **One runtime** — bitstream loader: loads the circuit manifest, pre-allocates memory, steps aside.
-- **One kernel** — a collection of declared-timing circuits, indistinguishable from application circuits except by channel subscription.
-- **Deterministic under any load** — the dispatch table is a theorem; runtime decisions are executions of that theorem.
+- **Bitstream loader** — the runtime loads the circuit manifest, pre-allocates all memory from a static resource profile, and steps aside. No dynamic allocator.
+- **Kernel is circuits** — every OS service is a declared-timing circuit, indistinguishable from application circuits except by channel subscription. No privilege rings needed.
+- **Execution is a FSM** — IDLE → PLAN → EXECUTE → EVALUATE. The dispatch table is a compile-time theorem; runtime decisions are executions of that theorem.
+- **Register forwarding and multi-stack pipeline** — the hardware SP is reserved for the runtime only; circuits use software-managed register stacks.
+- **Memory manager is two questions** — which tier, which circuit. All allocations are compile-time decisions; `out of memory` is a circuit removal event.
+- **ARM hardware mapped explicitly** — clock domains (CLKIN/CNTCLKEN/ATCLKEN), ACP for accelerator coherency, core power modes (STANDBYWFI2/Retention/Dormant), gathering/non-gathering memory regions.
+- **Cryptographic circuit identity** — circuits are signed at compile time; the runtime verifies signatures before execution. Privilege rings, Spectre/Meltdown mitigations, SMEP/SMAP, ASLR become structurally irrelevant.
+- **AI-regulated OS** — the runtime adapts clock frequency, L1 pre-population, and core affinity using the compile-time dispatch table as lookahead. Speculative pre-conditioning, not reactive compensation.
+- **Native substrate for ML** — declared memory tiers, compile-time weight placement, channel-based tensor routing, GPU as mathematical circuit array.
 
 → **[Paper III: The OS and Runtime](docs/papers/03-os-and-runtime.md)**
 
@@ -66,9 +75,13 @@ When the OS is written in the same language, the runtime and kernel converge. Th
 
 A CPU designed for software that declares its schedule has no use for an out-of-order engine, branch predictor, or L2/L3 cache hierarchy. The freed die area — 70–90% of a modern CPU — is reinvested into execution ports, more cores, and clock rate. Unified memory removes the VRAM/DRAM boundary. The result is an architecture where every transistor performs computation, scaling better with every process node than any OOO processor.
 
-- **One architecture** — unified memory, declared access windows, layered tiers, clock distribution as correctness primitive.
-- **Not x86. Not ARM. Not RISC-V.** — defined by declarations, not instruction sets. Any silicon can implement it.
-- **Hardware cost** — 3–4× reduction for equivalent inference throughput, because the transistors that remain all compute.
+- **Unified memory** — DRAM and on-device memory on a single bus; declared access windows replace coherency hardware.
+- **Layered tiers** — `register`, `ephemeral`, `task`, `session`, `permanent`, `cold` map directly to silicon: register file, L1, L1/L2, DRAM, pinned DRAM, NVMe.
+- **Die area reallocation** — OOO engine, branch predictor, rename tables, speculation buffers removed; area reinvested in wide execution ports, large register file, more cores.
+- **Process scaling advantage** — without speculation machinery, each new process node translates directly into more compute, not more speculative complexity.
+- **GPU as circuit array** — channels are broadcast; one declared signal reaches all subscribed accelerators. Precise and imprecise resources unified under the same declaration model.
+- **New RAM technologies** — HBM, LPDDR, NVMe-over-fabric all expressible as declared tiers with latency bounds in `system.cap`.
+- **Not x86. Not ARM. Not RISC-V.** — defined by declarations, not instruction sets. Any silicon can implement it. Hardware cost: 3–4× reduction for equivalent inference throughput.
 
 → **[Paper IV: Hardware Architecture Implications](docs/papers/04-hardware-architecture.md)**
 
@@ -84,7 +97,7 @@ That is not a product pitch. It is the description of what computing looks like 
 
 ## Architecture Decision Records
 
-The ADRs record implementation decisions within Paper I — the near-term path to a working prototype.
+The ADRs record implementation decisions for the near-term Rust prototype (`Channel<T>` syntax, proc-macro annotations, `system.cap`, `cargo-timeslice`). The prototype is a research vehicle — a way to validate the four rules on existing hardware. The language described in the papers is a separate, later destination.
 
 | # | Title | Status |
 |---|---|---|
