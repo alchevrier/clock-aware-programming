@@ -932,12 +932,12 @@ ARM cores expose a structured set of power modes. The runtime manages these as a
 | Power state | ARM terminology | Runtime trigger | When used |
 |---|---|---|---|
 | On | Normal | Any circuit assigned to this core | Hot-path and cold-path execution |
-| Standby | `STANDBYWFI` / `STANDBYWFE` | No circuit assigned this window; wake event expected soon | Short idle gaps between windows; core wakes on next declared window tick |
+| Standby | `STANDBYWFI` / `STANDBYWFI2` | No circuit assigned this window; wake event expected soon | Short idle gaps between windows; core wakes on next declared window tick |
 | Retention | `Ret` | No circuit assigned for N ticks; L1 state must be preserved | Gaps longer than a few windows where re-powering L1 would cost more than retention |
 | Dormant | Individual Core Shutdown | Core has no assigned circuits for the foreseeable dispatch horizon | Cold cores with no scheduled work; full power removal except for wake logic |
 | Off | Full off | Core removed from `system.cap` at runtime | Permanent removal; state not preserved |
 
-`STANDBYWFI` is the most common idle state. The runtime enters it at the end of a window when the dispatch table shows no circuit assigned for the immediately following window. The core halts execution and waits for an interrupt — in the clock-aware model, the only interrupt that fires is the hardware timer tick at the next declared window boundary. No spurious wakeup, no IRQ to classify, no scheduler to re-enter. The core wakes exactly when the next declared circuit is due, executes it, and returns to standby.
+`STANDBYWFI` (and `STANDBYWFI2` on multi-threaded cores) is the most common idle state. The runtime enters it at the end of a window when the dispatch table shows no circuit assigned for the immediately following window. The core halts execution and waits for an interrupt — in the clock-aware model, the only interrupt that fires is the hardware timer tick at the next declared window boundary. No spurious wakeup, no IRQ to classify, no scheduler to re-enter. The core wakes exactly when the next declared circuit is due, executes it, and returns to standby.
 
 `Dormant` mode is used for cold cores that the dispatch table shows unoccupied for many ticks ahead. The runtime transitions them to Dormant via the power controller declared in `system.cap`. The wake latency for Dormant is longer than for Standby — typically hundreds of ticks — so the runtime's lookahead must see a circuit arriving with enough lead time to wake the core before the window opens. This wake latency is declared in `system.cap` and the compiler accounts for it in the dispatch table: a cold core assigned a circuit must be woken at `window_start − wake_latency_ticks`. If the lookahead is insufficient, the compiler selects a different core or adjusts the window.
 
