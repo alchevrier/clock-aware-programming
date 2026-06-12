@@ -272,24 +272,28 @@ Every collection in the standard library is array-backed. There are no linked li
 
 | Conventional | Clock-aware stdlib |
 |---|---|
-| `LinkedList<T>` — pointer per node, cache-hostile | `ArrayDeque<T>` — contiguous, prefetcher-optimal |
-| `HashMap<K,V>` — heap-allocated buckets, pointer chase | `FlatMap<K,V>` — sorted array, binary search, L1-resident |
-| `BTreeMap<K,V>` — tree nodes, pointer chase | `SortedArray<K,V>` — contiguous, declared size |
-| `Vec<Box<T>>` — pointer indirection per element | `Array<T>` — inline elements, declared capacity |
+| `LinkedList<T>` — pointer per node, cache-hostile | `channel ArrayDeque` — contiguous, prefetcher-optimal |
+| `HashMap<K,V>` — heap-allocated buckets, pointer chase | `channel FlatMap` — sorted array, binary search, L1-resident |
+| `BTreeMap<K,V>` — tree nodes, pointer chase | `channel SortedArray` — contiguous, declared size |
+| `Vec<Box<T>>` — pointer indirection per element | `channel Array` — inline elements, declared capacity |
 
 Every access pattern the programmer can express in the standard library is one the hardware prefetcher can predict: stride access into a contiguous array. Cache miss latency from pointer chasing is not a performance concern the programmer must avoid — it is a construct the language does not provide. The hardware-friendliness is structural, not disciplinary.
 
-Custom collections can be defined by three declarations:
+A custom channel is declared with five components:
 
-```java
-collection PriceTable {
-    val size = 1024;
+```
+channel PriceTable {
+    val element = Price
+    val tier    = task
+    val size    = 1024
     fn writeAccessPattern(symbol: Symbol) = symbol.id & 0x3FF
     fn readAccessPattern(symbol: Symbol)  = symbol.id & 0x3FF
 }
 ```
 
-- **`size`** — the declared capacity, in elements. The compiler knows the memory footprint at build time, verifies it fits within the declared tier (L1, L2), and rejects declarations that exceed it.
+- **`element`** — the declared value type. The compiler knows the element width at build time and uses it to compute the channel's total memory footprint.
+- **`tier`** — the lifetime keyword (`ephemeral`, `task`, `session`, `permanent`, or `cold`) that declares which memory tier this channel occupies. The compiler pins the channel's backing array to that tier, verifies the footprint fits within its capacity, and reclaims it at the tier's declared boundary.
+- **`size`** — the declared capacity, in elements. The compiler verifies the footprint (`size × sizeof(element)`) fits within the declared tier and rejects declarations that exceed it.
 - **`writeAccessPattern`** — a pure function from write key to index. Called by the producer to locate the slot to write into.
 - **`readAccessPattern`** — a pure function from read key to index. Called by the consumer to locate the slot to read from. The key type may differ from the write key.
 
@@ -299,9 +303,11 @@ This replaces hash functions, tree traversals, and associative containers at onc
 
 The consequence is that standard data structures fall out as special cases. A SPSC ring buffer is the clearest example — producer and consumer have different keys and independent access patterns:
 
-```java
-collection Spsc<T> {
-    val size = 64;
+```
+channel SpscFill {
+    val element = Fill
+    val tier    = task
+    val size    = 64
     fn writeAccessPattern(producerIndex: Long) = producerIndex & (size - 1)
     fn readAccessPattern(consumerIndex: Long)  = consumerIndex & (size - 1)
 }
@@ -311,9 +317,11 @@ The producer passes `producerIndex`; the consumer passes `consumerIndex`. The ac
 
 A FIFO (queue) makes the asymmetry explicit — tail advances on write, head advances on read, and they are independent keys:
 
-```java
-collection Fifo<T> {
-    val size = 64;
+```
+channel FifoFill {
+    val element = Fill
+    val tier    = task
+    val size    = 64
     fn writeAccessPattern(tail: Long) = tail & (size - 1)
     fn readAccessPattern(head: Long)  = head & (size - 1)
 }
@@ -321,32 +329,34 @@ collection Fifo<T> {
 
 A LIFO (stack) is different again — both read and write use the same index expression (the top pointer), but the key moves in opposite directions: the caller increments it before a write and decrements it before a read:
 
-```java
-collection Lifo<T> {
-    val size = 64;
+```
+channel LifoFill {
+    val element = Fill
+    val tier    = task
+    val size    = 64
     fn writeAccessPattern(top: Long) = top & (size - 1)   // caller increments top first
     fn readAccessPattern(top: Long)  = top & (size - 1)   // caller decrements top first
 }
 ```
 
-The collection does not manage the key — the caller holds it and passes it on each access. The collection declares only the mapping from key to slot. This means the collection has no internal state: no head, no tail, no top field stored anywhere. The key lives in the caller's declared cycle scope, reclaimed at the cycle boundary like any other value.
+The channel does not manage the key — the caller holds it and passes it on each access. The channel declares only the mapping from key to slot. This means the channel has no internal state: no head, no tail, no top field stored anywhere. The key lives in the caller's declared cycle scope, reclaimed at the cycle boundary like any other value.
 
-The entire collection API is therefore two operations:
+The entire channel API is therefore two operations:
 
-```java
-collection.put(key, value)   // resolves slot via writeAccessPattern(key), writes value
-collection.get(key)          // resolves slot via readAccessPattern(key), returns value
+```
+name.put(key, value)   // resolves slot via writeAccessPattern(key), writes value
+name.get(key)          // resolves slot via readAccessPattern(key), returns value
 ```
 
-No `push`. No `pop`. No `enqueue`. No `dequeue`. No `peek`. Every data structure in the language, regardless of its access discipline, exposes the same two-operation interface. The discipline — FIFO, LIFO, ring, table — is encoded in what key the caller passes, not in the API. `put` and `get` are the only verbs the programmer needs to know.
+No `push`. No `pop`. No `enqueue`. No `dequeue`. No `peek`. Every channel in the language, regardless of its access discipline, exposes the same two-operation interface. The discipline — FIFO, LIFO, ring, table — is encoded in what key the caller passes, not in the API. `put` and `get` are the only verbs the programmer needs to know.
 
-This is the deeper unification: `channel T` itself is a collection with a declared access pattern. The channel model does not sit above the collection model — it is an instance of it. A `channel T` is simply a collection whose `writeAccessPattern` and `readAccessPattern` happen to be the ring-buffer masking arithmetic, and whose keys — the producer and consumer indices — are managed by the runtime at the cycle boundary.
+This is the deeper unification: every data path in the system — ring buffer, queue, stack, lookup table — is the same construct. A concrete `channel` declaration with a declared element type, a declared size, and a pair of access patterns, accessed via `put` and `get`. The stdlib's `channel` declarations are simply instances of this pattern whose access patterns encode ordered delivery and whose keys are managed by the runtime at the cycle boundary. The programmer could declare them themselves. The stdlib provides them as a convenience.
 
-Every inter-function data path in the system, whether called a channel, a ring buffer, a queue, a stack, or a lookup table, is the same thing: a declared size and a pair of declared access patterns, accessed via `put` and `get`. The word "channel" is not a special construct — it is a named convention for a collection whose access pattern encodes ordered delivery. If the programmer wanted, they could declare it themselves. The stdlib `channel T` is provided as a convenience, not as a primitive.
+There is no separate collection model. There is no separate channel model. There is one declaration form: `channel`, with a declared element type, a declared tier, a declared size, and declared access patterns. Every channel is concrete. Every channel declares its memory tier. There are no type parameters.
 
 The compiler sees one construct. The hardware sees one thing: a stride into a contiguous array.
 
-**Every standard library function declares its own cycle budget.** This is mandatory — a stdlib function without a declared `@Timeslice` does not compile into the standard library. The declaration is per-target: `put` on `FlatMap<K,V>` against a Skylake target at 4 GHz costs a different number of cycles than the same call against a Cortex-A72. The stdlib ships a budget table per supported target, derived from the same ALU cost model the compiler uses.
+**Every standard library function declares its own cycle budget.** This is mandatory — a stdlib function without a declared `@Timeslice` does not compile into the standard library. The declaration is per-target: `put` on `channel FlatMap` against a Skylake target at 4 GHz costs a different number of cycles than the same call against a Cortex-A72. The stdlib ships a budget table per supported target, derived from the same ALU cost model the compiler uses.
 
 When the programmer calls a stdlib function inside a timed `fn`, the compiler substitutes the stdlib function's declared budget for the target into the caller's accumulated cycle count. The programmer does not need to look up the cost manually — the compiler propagates it:
 
