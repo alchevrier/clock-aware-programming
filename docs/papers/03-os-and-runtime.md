@@ -706,6 +706,53 @@ The runtime tracks register file state across window boundaries. When a circuit 
 
 Each circuit executes on its own declared stack — not the hardware stack. The hardware stack pointer (`SP`) is reserved exclusively for the runtime's dispatch loop itself: a fixed, small, runtime-only stack that never grows during normal circuit execution. Every circuit has a declared stack region in its manifest, pre-allocated in the `task` tier (L1/L2 pinned) before the circuit's first window opens. The runtime maintains a **multi-stack pipeline**: each slot in the dispatch table has its own base pointer into its pre-allocated stack region. Switching between circuits requires no register-save/restore — the next circuit's registers are already known from the forwarding map, and its stack is already present in L1. A circuit transition costs exactly the ticks between window boundaries. Nothing more.
 
+### Stack Memory, Speculative Memory, and the Flat Address Map
+
+The multi-stack model has a direct consequence for how physical memory is partitioned. Each circuit slot in the dispatch table owns three distinct physical regions, all declared in the manifest and pre-allocated before the slot's first window:
+
+```
+  Per-circuit physical regions (pre-allocated at slot time)
+
+  ┌─────────────────────────────────────────────────────┐
+  │  LIVE REGION (task tier, L1/L2 pinned)              │
+  │  Stack frame + declared task-tier channel buffers   │
+  │  Written by this circuit, read by declared consumers│
+  │  Physical base: manifest.live_base                  │
+  ├─────────────────────────────────────────────────────┤
+  │  SPECULATIVE REGION A (task tier, L1 pinned)        │
+  │  Branch arm A — compiler evaluates both sides       │
+  │  Written during window, discarded if arm B wins     │
+  │  Physical base: manifest.spec_a_base                │
+  ├─────────────────────────────────────────────────────┤
+  │  SPECULATIVE REGION B (task tier, L1 pinned)        │
+  │  Branch arm B — the other side of every hot branch  │
+  │  Written during window, discarded if arm A wins     │
+  │  Physical base: manifest.spec_b_base                │
+  └─────────────────────────────────────────────────────┘
+```
+
+**The live region** is the circuit's primary working memory — its declared stack, its `task`-tier channel read buffers, its intermediate `ephemeral` values. This is what a conventional stack holds, but pre-allocated at a known physical address, pinned to L1, and never dynamically grown.
+
+**The speculative regions** are where the compiler's compile-time branch speculation lands. When the compiler evaluates both sides of a branch — because both sides fit within the declared budget and neither produces side effects that cannot be isolated — it emits instructions that write each arm's result into its own dedicated physical region. The two regions are computed in parallel (or in declared instruction-wave order). At the cycle boundary, the runtime reads the branch condition result and commits the winning arm's output to the live channel. The losing arm's region is discarded — it is overwritten at the next window without any reclaim instruction, because it was never part of the circuit's declared live state.
+
+```
+  Speculative evaluation during a window
+
+  branch condition ─┬─► ARM A instructions ──► SPEC REGION A
+                    │                               │
+                    └─► ARM B instructions ──► SPEC REGION B
+                                                    │
+  at window boundary:                               │
+  condition resolved ──► winning arm ─────────────►│──► live channel
+                         losing arm   discarded ◄───┘
+```
+
+This is not hardware speculation. Hardware speculation occurs at runtime, speculatively, with a misprediction penalty on the wrong guess. This is **compiler-directed static evaluation** of both arms at declared cycle positions, with a deterministic commit at the cycle boundary. The two speculative regions are physical addresses the compiler chose at build time. The commit is a manifest-declared write to a live channel address. No branch predictor is involved. No pipeline flush on a wrong guess. The cost of evaluating both arms is paid once, deterministically, within the declared budget — and the compiler proved it fits before emitting the code.
+
+The speculative region size is part of the circuit's manifest footprint. The compiler calculates the maximum output size of each arm — from the declared types of the channels those arms produce — and reserves exactly that much space in each speculative region. The runtime includes both speculative regions in the circuit's pre-allocation. They count against the circuit's declared `task`-tier footprint and are verified against L1 capacity at compile time, the same as every other declared value. Speculative evaluation has no hidden memory cost. It is declared, bounded, and compiler-verified like everything else.
+
+The physical address map for the whole system is therefore the sum of every circuit's three regions, plus their `session` and `permanent` tier allocations, plus the runtime's own tables. The entire physical address space is known before the first instruction executes. The runtime does not discover it. It reads the compiled address map, issues the pre-allocations, wires the DMA descriptors, and begins the dispatch loop. The memory layout is a compile-time theorem. Execution is the proof that the theorem holds.
+
 ### The Trace Unit — Proving the Compiler Was Right
 
 On ARM (and equivalent architectures), the trace unit timestamps every instruction as it commits. The clock-aware runtime subscribes to the trace unit's output as a `channel TraceEvent` through the `ObservabilityCircuit`. This gives the system something no conventional OS has ever had: a continuous, hardware-sourced, instruction-level audit of every circuit's actual execution.
