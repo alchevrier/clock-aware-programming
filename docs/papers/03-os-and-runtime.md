@@ -1620,9 +1620,13 @@ A trading engine and a risk checker on adjacent cores hand off a `session<RiskLi
 
 The programmer can annotate handoff points to give the compiler and runtime additional information:
 
-```java
-@Handoff(tier = session, from = "TradingEngine", to = "RiskChecker", maxStaleness = "1ms")
-val riskLimits: session<RiskLimitTable>
+```
+channel RiskLimits {
+    val element      = RiskLimitTable
+    val tier         = session
+    val size         = 1
+    @Handoff(from = TradingEngine, to = RiskChecker, maxStaleness = "1ms")
+}
 ```
 
 Circuit diagram — two clocked blocks, one wire, one declared memory tier:
@@ -1631,7 +1635,7 @@ Circuit diagram — two clocked blocks, one wire, one declared memory tier:
   core 1                                          core 2
   ┌─────────────────────────────┐                ┌─────────────────────────────┐
   │        TradingEngine        │                │         RiskChecker         │
-  │   @Timeslice(cycle = 10ns)  │                │   @Timeslice(cycle = 8ns)   │
+  │  @Timeslice(core=1,period="10ns") │             │  @Timeslice(core=2,period="8ns") │
   │                             │                │                             │
   │  ┌──────┐                   │                │                   ┌───────┐ │
   │  │ ALU  │                   │                │                   │  ALU  │ │
@@ -1640,12 +1644,13 @@ Circuit diagram — two clocked blocks, one wire, one declared memory tier:
   │  └──────┘         │         │                │         ▲         └───────┘ │
   │                   │         │                │         │                   │
   │             ┌─────▼──────────────────────────────────┐│                   │
-  │             │          session<RiskLimitTable>        ││                   │
-  │             │          (DRAM, pinned, resident)       ││                   │
-  │             │                                         ││                   │
-  │             │  @Handoff(from = TradingEngine,         ││                   │
-  │             │           to   = RiskChecker,           ││                   │
-  │             │           maxStaleness = 1ms)           ││                   │
+  │             │  channel RiskLimits {                   ││                   │
+  │             │    val element = RiskLimitTable         ││                   │
+  │             │    val tier    = session                ││                   │
+  │             │    @Handoff(from = TradingEngine,       ││                   │
+  │             │             to   = RiskChecker,         ││                   │
+  │             │             maxStaleness = "1ms")       ││                   │
+  │             │  }                                      ││                   │
   │             └─────────────────────────────────────────┘│                   │
   └─────────────────────────────┘                └─────────────────────────────┘
         │                                                        │
@@ -1683,10 +1688,14 @@ Every compiled circuit manifest is signed with the organisation's private key be
 
 `@Handoff` extends this naturally. A handoff between two circuits is only permitted if both manifests are signed by keys within the same declared allocation:
 
-```java
-@Handoff(tier = session, from = "TradingEngine", to = "RiskChecker",
-         maxStaleness = "1ms", org = "AcmeTradingCo")
-val riskLimits: session<RiskLimitTable>
+```
+channel RiskLimits {
+    val element      = RiskLimitTable
+    val tier         = session
+    val size         = 1
+    @Handoff(from = TradingEngine, to = RiskChecker,
+             maxStaleness = "1ms", org = AcmeTradingCo)
+}
 ```
 
 The `org` field names the allocation. At compile time, the compiler verifies that both `TradingEngine` and `RiskChecker` are signed by a key in the `AcmeTradingCo` key ring declared in `system.cap`. At runtime, the dispatch table enforces it: if a circuit with a different organisational signature attempts to read `riskLimits`, the subscription check fails — not as a runtime exception, not as an access-control list lookup, but as a structural impossibility. The memory location is not addressable from outside the declared allocation.
@@ -1787,12 +1796,26 @@ On ARM, the runtime can issue `PRFM` (Prefetch Memory) and `RPRFM` (Range Prefet
 
 The clock-aware channel model makes this structural. An SPI sensor becomes:
 
-```java
-val sensor = Channel.from(Device.SPI0, clock: 1.MHz5)
-sensor.subscribe(reading -> process(reading))
+```
+// system.cap
+channels.SpiReading.device   = SPI0
+channels.SpiReading.clock_hz = 1_500_000
+
+// programme
+channel SpiReading {
+    val element = SensorSample
+    val tier    = task
+    val size    = 1
+}
+
+circuit SpiSensor {
+    @Timeslice(core = 1, period = "667ns", budget = "200ns")
+    fn read(in: channel SpiReading): channel ProcessedReading =
+        channel.of(process(in.get(0)))
+}
 ```
 
-The compiler resolves from the `Device.SPI0` descriptor: the DREQ line number, the DMA channel, the clock divider from the declared rate and `cpu_model`, the CPOL/CPHA mode, the chip-select timing, the bus address translation, the cache flush requirements, and the IRQ registration. The programmer declared what they needed — a 1.5 MHz SPI channel from device SPI0. The compiler translated that declaration into every hardware detail the runtime needs. No oscilloscope. No logic analyser. No three days debugging CPOL/CPHA mode mismatch. The device descriptor carries the mode; the compiler applies it; the compiler verifies the type matches the SPI frame size. If it compiles, the wiring is correct.
+The compiler resolves from the `system.cap` `SpiReading` device declaration: the DREQ line number, the DMA channel, the clock divider from the declared `clock_hz` and `cpu_model`, the CPOL/CPHA mode, the chip-select timing, the bus address translation, the cache flush requirements, and the IRQ registration. The programmer declared what they needed — a 1.5 MHz SPI channel backed by device SPI0. The compiler translated that declaration into every hardware detail the runtime needs. No oscilloscope. No logic analyser. No three days debugging CPOL/CPHA mode mismatch. The device descriptor carries the mode; the compiler applies it; the compiler verifies the element type matches the SPI frame size. If it compiles, the wiring is correct.
 
 ### The Runtime Is the Type Enforcer
 
