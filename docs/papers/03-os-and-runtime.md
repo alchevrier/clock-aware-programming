@@ -1422,6 +1422,31 @@ The programmer never thinks about any of this unless she has a **critical path**
 
 The conventional alternative requires the programmer to manage all of the right column explicitly and correctly, under time pressure, with tools that measure rather than prove, on a system that is simultaneously running an OS whose timing is unknown. The clock-aware model moves the entire right column into the compiler. The programmer writes declarations. The compiler writes proofs. The hardware executes them.
 
+### The Lie of Imperative Concurrency
+
+Imperative programming presents concurrency as the natural state of computation: spawn threads, let them run in parallel, share memory freely. This is not what hardware does. Hardware executes one instruction per cycle per core. Memory bus arbitration is sequential. Cache coherency protocol is sequential. Every access to shared state resolves to a serialised sequence of loads and stores. The parallelism is an abstraction; the sequentiality is the physical truth.
+
+The lock reveals this. When a programmer places a lock around shared state, she is not adding sequentiality — she is admitting that it was always there. She is acknowledging that two threads cannot safely touch the same memory at the same time, that the hardware will serialise them anyway at the cache coherency level if she does not, and that the program's correctness depends on a specific serialisation order. The lock is not a tool for managing concurrency. It is an apology for having pretended that concurrency existed in the first place.
+
+The deeper problem is that locks prove nothing at compile time. The programmer writes a lock, the compiler emits the fence instructions, and the program runs — and at runtime, two threads contend for the same lock, one waits, the CPU stalls, and the scheduler intervenes. The intervention has unknown duration. The duration was unknown because the concurrency model that made the lock necessary also made the waiting time unprovable. The lock was the solution to a problem the threading model created.
+
+**In reality, everything is event-driven and sequential.** A packet arrives — an event. A price update is computed — an event. A quote is emitted — an event. Each event has a defined cause, a defined output, and a defined duration. Nothing that happens at the silicon level is truly parallel in the way the threading model implies. The threading model imposed an approximation of parallelism on top of sequential hardware, then introduced locks to repair the cases where the approximation broke.
+
+The clock-aware model starts from the truth. Every circuit is event-driven: it executes when its channel has data, not when a scheduler decides. Every circuit is sequential: it has a declared window, it runs to completion, and no other circuit on the same core touches the same data during that window — proved by the compiler, not asserted by a lock. The channel graph is the causal graph of the entire system, declared statically, verified structurally. There is no shared mutable state between circuits — only channels, which are single-writer, and which transfer ownership of a value at a declared moment.
+
+```
+  Imperative concurrency model:
+  threads share memory → require locks → locks serialise → admit sequentiality
+  lock contention → scheduler intervention → unknown wait → unknown latency
+
+  Clock-aware model:
+  circuits own their data → channels transfer ownership → no sharing
+  ordering proved at compile time → no lock needed → no contention possible
+  sequentiality is declared, not recovered
+```
+
+A lock is a runtime mechanism for enforcing what the clock-aware model enforces at compile time: that at any given moment, exactly one piece of code has access to a given value. The difference is that the clock-aware compiler proves this statically, for every value in the system, before a single instruction is emitted. The programmer never writes a lock because the compiler has already guaranteed that no two circuits can conflict — by construction, from the declarations. The sequentiality that locks were invented to enforce is the model, not an afterthought.
+
 Cores 1–N run application circuits exclusively. Their L1 holds only circuit data — declared channel buffers, task-tier values, the working set the compiler proved fits. No runtime data structure ever touches their cache. No dispatch loop instruction ever runs on them. They receive a single ACP cache-line EXECUTE signal from core 0 at the start of each window, execute their declared instruction sequence, and return to `STANDBYWFI`. Their entire L1 budget belongs to the application.
 
 ```
