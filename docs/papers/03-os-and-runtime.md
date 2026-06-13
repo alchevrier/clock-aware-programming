@@ -349,6 +349,33 @@ The mental model is a PCB where you can slot in and remove chips while the board
 
 This has a direct consequence for correctness: a program cannot affect another program's timing unless it is explicitly connected via a declared channel. There is no shared address space to corrupt. There is no scheduler to starve. There is no heap to fragment. Two circuits running on the same machine are as isolated as two chips on separate parts of a PCB — unless a wire between them is explicitly soldered into the design.
 
+### Live Circuit Swap — Zero-Downtime Hot Reload
+
+Replacing a running circuit with a new version — deploying a patch, updating a trading algorithm, swapping a driver — follows the same `add_circuit` protocol as any other slot operation, with one additional step: ownership transfer.
+
+The protocol:
+
+1. **Stage the new version.** The new manifest is written to a staging slot in the dispatch table alongside the old circuit's live slot. The runtime pre-allocates the new circuit's full working set from the appropriate tier. This happens in the background — the old circuit continues executing in its declared windows while the new version is being prepared.
+
+2. **Signal the old circuit.** At the next window boundary, the runtime delivers `channel UpdateSignal` to the running circuit — the same mechanism as any other signal. The old circuit finishes its current window. It writes any in-flight `session`-tier state that must survive the swap to a declared transfer channel.
+
+3. **Transfer ownership at the next dispatch boundary.** The runtime atomically replaces the old circuit's dispatch table entry with the new one. The new circuit's channel subscriptions are registered in place of the old circuit's. The transfer channel — if declared — is handed to the new circuit's first window as its initial input. The swap costs exactly one `runtime_overhead_ticks` gap between the last old window and the first new window. No frame is dropped. No packet is lost. No connection is interrupted — the `session`-tier channel backing the TCP connection is owned by the new circuit from the moment of the swap.
+
+4. **Reclaim the old circuit's exclusive state.** Any `task`-tier or `ephemeral`-tier state owned by the old circuit is reclaimed immediately at the swap boundary — it did not survive the swap and was not intended to. Any `session`-tier state explicitly excluded from the transfer channel is released back to the memory tier. The old manifest slot is freed.
+
+```
+  tick N     old circuit window    (last execution)
+  tick N+1   runtime_overhead      (swap: dispatch table entry replaced atomically)
+  tick N+2   new circuit window    (first execution, transfer channel available)
+             ── no gap in channel delivery ──
+             ── no dropped frames ──
+             ── session state transferred ──
+```
+
+The key constraint: **the swap boundary is a declared tick, not a runtime decision**. The old circuit declares in its manifest which `session` values must survive a swap — the transfer channel is typed and sized at compile time. A swap that would require transferring more state than the declared transfer channel can hold is a compile error. The programmer knows before deployment whether the hot reload is state-safe. The compiler proves it. The runtime executes the proof.
+
+This is categorically different from a container rolling update or a Kubernetes pod restart. Those involve a process boundary, a new address space, a new socket, and a protocol-level handshake to transfer state. A clock-aware live swap has none of those: same address space, same channel backing, same dispatch table, one tick of overhead.
+
 ### Booting Is Two Steps: Add the Runtime, Then Add the Kernel Circuits
 
 Boot is not a special phase. It is two sequential applications of the same primitive, performed once at power-on.
@@ -542,6 +569,38 @@ In the ARM memory model, **Gathering** means the hardware may merge multiple acc
 **Hardware-timed (Non-Gathering) resources** are driven by the DREQ signal. The compiler wires the signal to the DMA trigger at build time. The CPU never touches the hot path. Non-Gathering semantics are the default for `ReadWriteDevice` and `ReadOnlyDevice` channel mappings — the compiler emits the correct memory attribute in the physical address mapping and the DMA descriptor, so the hardware enforces ordering without any runtime instruction from the CPU.
 
 The consequence: `dmb` / `dsb` / `isb` memory barrier instructions are absent from the hot path. A barrier is a runtime signal that the programmer could not express the ordering statically. In the clock-aware model, the ordering is declared — Gathering resources via the window boundary, Non-Gathering resources via the hardware signal. The compiler proves both. No barrier is necessary.
+
+### The Network Stack Is a Circuit
+
+The network stack is not a separate subsystem. It is a chain of declared circuits, each consuming a channel from the layer below and producing a channel to the layer above — exactly like any other pipeline in the system. There is no special path for network data. There is no kernel network buffer separate from the tier system. There is no `send()` syscall that copies data into a kernel socket buffer.
+
+**Sending** is a channel write. The application circuit writes its payload to a declared `task`-tier channel. The network stack's next circuit — the transport layer — is subscribed to that channel. At its declared window, it reads the payload, frames it, and writes to the `channel EthernetFrame` that the `NicCircuit` consumes. The `NicCircuit` picks it up at its own window boundary and the DMA engine carries it to the wire. The application circuit never called a syscall. It wrote to a channel. The network stack is downstream in the channel graph.
+
+**Receiving** is a DMA write followed by an `early_fire`. The NIC's DMA engine writes the incoming frame directly into `channel EthernetFrame`'s declared physical address — the same address the `NicCircuit` reads from, the same address that was pre-allocated by the runtime at slot time. The DMA completion asserts the `IrqSignal` on `NicCircuit`'s dispatch table entry. The runtime sees the `early_fire` flag on its next WATCH iteration and promotes `NicCircuit` to the head of the dispatch queue. `NicCircuit` executes at the next window boundary — not at an arbitrary interrupt time, not after a scheduler decision, but at the next declared tick — and delivers the frame up the channel chain to whoever subscribed.
+
+```
+  Send path:
+  AppCircuit writes → channel Payload (task tier, L1)
+                          │
+                    TransportCircuit reads at next window
+                          │ frames + checksums
+                    writes → channel EthernetFrame
+                          │
+                    NicCircuit reads at next window
+                          │ DMA to wire
+                    ──────────────────────────────► wire
+
+  Receive path:
+  wire → NIC DMA writes → channel EthernetFrame (L1-pinned physical address)
+                          │ sets early_fire on NicCircuit
+                    runtime sees flag on next WATCH iteration
+                          │ promotes NicCircuit
+                    NicCircuit executes at next window boundary
+                          │ delivers frame up channel chain
+                    TransportCircuit → AppCircuit
+```
+
+The network stack has no concept of push vs pull from the programmer's perspective — data flows through channels in the direction the channel graph declares. Push and pull are implementation details of the tier model: a `task`-tier channel is available for one window and then reclaimed; a `session`-tier channel persists across windows. TCP connection state is a `session`-tier channel — it lives for the duration of the connection and is reclaimed when the circuit that owns it is removed. There is no separate TCP socket buffer. There is no kernel accept queue. There is a declared channel with a declared tier and a declared owner. The connection is the channel.
 
 ### Channel Subscription Inference
 
@@ -1164,6 +1223,33 @@ The `clock` declaration is therefore a binding between the programme's time mode
 
 This is what distinguishes declared timing from OS scheduling. A Linux `SCHED_DEADLINE` task with a 4 ns period is not scheduled at 4 ns precision — the scheduler itself has microsecond granularity, cache warm-up costs, context-switch overhead, and kernel execution time that all come out of the task's budget invisibly. A clock-aware circuit with a 4 ns window is scheduled at `CLKIN` precision because the runtime does not context-switch, does not have a scheduler quantum, and has already proved that its own overhead is zero on the hot path. The `clock` declaration is honoured at the oscillator, not approximated by a software layer above it.
 
+### CLKIN Is the Ground Truth — Wall Clock Is a Label
+
+CLKIN does not drift from the system's perspective. It is the system's perspective. Every timing proof the compiler produces is in CLKIN ticks. Every window boundary the runtime enforces is a CLKIN tick count. The hardware oscillator that drives CLKIN is the only clock that matters for correctness.
+
+What can drift is the mapping from CLKIN ticks to wall-clock time — the label that says "tick 4,000,000,000 corresponds to 2026-06-13T09:00:00.000000000Z". This label is not used by any circuit for execution. It is used only by circuits that need to stamp events with a human-readable timestamp (the `ObservabilityCircuit`, audit logs, the `@Measure` output). The label is managed by the `ClockCircuit`.
+
+The `ClockCircuit` does one thing: it subscribes to an external time source declared in `system.cap` — a PTP hardware timestamp, a GPS PPS signal, an NTP packet received via the `NicCircuit` — and maintains a declared `permanent`-tier mapping record:
+
+```
+// system.cap
+clock.wall_source    = PTP            // source of external time reference
+clock.sync_period_ms = 100            // how often to re-sync the label
+clock.max_drift_ns   = 50             // alarm threshold
+
+channel WallOffset {
+    val element = TickToNanosecondMapping
+    val tier    = permanent
+    val size    = 1
+}
+```
+
+The `ClockCircuit` reads the external time reference at its declared window, computes the offset between the external timestamp and the current CLKIN tick count, and writes the updated mapping to `channel WallOffset`. Any circuit that needs a wall timestamp reads from `channel WallOffset` and applies the mapping to its own CLKIN tick reading. The mapping update is a channel write — declared, typed, observable — not a hidden adjustment to a global variable.
+
+The internal timing proofs are entirely unaffected by this. The compiler proved that `parsePrice` runs for 200 ticks. It still runs for 200 ticks regardless of what the PTP source says about UTC. The only thing that changes when the wall offset is updated is what timestamp the `ObservabilityCircuit` prints next to that 200-tick window in the atom log. Correctness is in ticks. Observability is in nanoseconds. They are separate concerns, managed separately, and the separation is structurally enforced by the type system.
+
+If the external time source becomes unavailable — PTP link down, GPS antenna removed — the `ClockCircuit` signals `channel ClockSyncLost`. Circuits that declared a `maxStaleness` on their timestamp reads receive a `StalenessViolation`. The system continues executing at full correctness in ticks; only the wall-time label on events becomes stale. The declared staleness handler decides whether to continue with a stale label or to degrade gracefully. At no point does clock synchronisation loss affect the timing proofs or the dispatch table.
+
 ### Accelerator Coherency Port — Shared Memory Without CPU Involvement
 
 The ARM Accelerator Coherency Port (ACP) allows an accelerator — a GPU ALU array, a matmul unit, a DMA engine — to make coherent requests directly to the CPU's cache without involving the CPU. The accelerator reads or writes a cache line that the CPU has declared in its manifest, and the coherency protocol ensures the CPU sees a consistent view without a barrier instruction or a CPU-side flush.
@@ -1603,7 +1689,28 @@ An exception is an imperative pattern. It is the runtime seizing control from th
 
 ### Microservices Are Circuits with Declared Handoffs
 
-This model scales directly to what is conventionally called a microservice architecture — except without the network, without the serialisation, without the service mesh, without the latency. A microservice is a circuit. Its interface is its declared `channel T` subscriptions. Its deployment is adding it to the live system. Its communication with other services is a memory handoff at a declared tick boundary.
+This model scales directly to what is conventionally called a microservice architecture — except without the network, without the serialisation, without the service mesh, without the latency. And it scales further — across physical machines — by the same mechanism.
+
+**A TCP connection is a `session`-tier channel whose backing is network instead of DRAM.** Within a machine, two circuits hand off a `session`-tier value by writing to a DRAM address at a declared tick and reading from it at the next declared tick. Across machines, the mechanism is identical except that the physical backing is a network link instead of a memory bus, and the coherency gap is the declared round-trip latency of that link instead of the L3 coherency latency of a shared cache domain. The programmer declares the cross-machine channel in `system.cap`:
+
+```
+// system.cap
+channels.OrderStream.backing  = tcp
+channels.OrderStream.endpoint = "10.0.0.2:9000"
+channels.OrderStream.rtt_ns   = 50_000        // declared RTT + jitter margin
+
+channel OrderStream {
+    val element = Order
+    val tier    = session        // lives for the duration of the connection
+    val size    = 4096
+}
+```
+
+The compiler treats `OrderStream` as a `session`-tier channel with a coherency gap of `rtt_ns` ticks instead of L3 latency ticks. The write window must end at least `rtt_ns` ticks before the read window on the remote machine — the same proof obligation as any cross-core handoff, scaled to network latency. The compiler either satisfies it or rejects the program with a precise error: the declared RTT does not fit within the window budget.
+
+The TCP connection state itself is a `session` channel — it lives for the duration of the connection and is reclaimed when the circuit that owns it is removed from the dispatch table. There is no separate connection object, no file descriptor, no socket buffer in kernel space. The connection is the channel subscription. When the remote endpoint closes the connection, the `NicCircuit` delivers a `channel TcpClose` signal to the owning circuit. The circuit handles it in its declared exhaustive match. The `session`-tier memory is reclaimed by the runtime at the owning circuit's removal — the same reclaim protocol as any other `session` value.
+
+The consequence is that the distinction between "intra-machine microservices" and "inter-machine distributed systems" collapses to a single question: what is the declared backing and latency of the channel between them? Same machine, different cores: `session` tier, 50–200 ticks coherency gap. Different machines, same datacenter: `session` tier, network backing, 50,000 ns coherency gap. The circuit graph, the channel declarations, and the compiler's proof obligations are identical in both cases. Only the numbers change. A microservice is a circuit. Its interface is its declared `channel T` subscriptions. Its deployment is adding it to the live system. Its communication with other services is a memory handoff at a declared tick boundary.
 
 The handoff tier determines what kind of inter-service communication you get:
 
