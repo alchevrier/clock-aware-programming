@@ -210,6 +210,18 @@ The key constraint: **the swap boundary is a declared tick, not a runtime decisi
 
 This is categorically different from a container rolling update or a Kubernetes pod restart. Those involve a process boundary, a new address space, a new socket, and a protocol-level handshake to transfer state. A clock-aware live swap has none of those: same address space, same channel backing, same dispatch table, one tick of overhead.
 
+### Kernel Circuit Updates — The Harder Case
+
+Application circuit swap is clean because the channel profile is the complete interface: two circuits with identical channel profiles are substitutable at the dispatch table boundary by construction. Kernel circuit updates are harder because OS circuits are load-bearing for the runtime itself. `MemoryCircuit` manages the tier allocations every other circuit depends on. `ClockCircuit` produces the `channel Tick` that drives the runtime's own dispatch. `NamespaceCircuit` holds the mapping every `add_circuit` call resolves against. You cannot use the standard swap protocol on a circuit whose operation is a precondition for the swap protocol itself.
+
+The model addresses this through two mechanisms.
+
+**Channel name identity is the interface contract.** `MemoryCircuit` is not identified by a manifest hash or a version number — it is identified by the channels it produces: `channel SlotAck` and `channel RemovalSignal`. Any circuit that produces those channels with the same declared types and declared timing is, to the system, `MemoryCircuit`. A new version with a bug fix differs only in its internal computation — the channels it reads and writes are the same names, same types, same sizes. The compiler enforces this: if the new manifest's channel profile does not match the declared interface of the circuit it is replacing, it is a type error. The interface is the channel set. Version identity is implicit in it.
+
+**Load-bearing circuits are swapped in dependency order.** The runtime maintains a dependency graph among kernel circuits derived from their channel subscriptions — who produces `channel Tick`, who consumes it, who produces `channel SlotAck`, who depends on it. A kernel circuit whose consumers are themselves load-bearing for the swap cannot be swapped first. The runtime resolves the update order: leaf circuits (those with no load-bearing dependents) swap first. Load-bearing circuits swap after all their dependents have been updated and are running against the new interface. The `MemoryCircuit` — the most load-bearing of all — swaps last, in a brief quiescent window during which the other kernel circuits have already transitioned.
+
+The quiescent window for `MemoryCircuit` is short by design: the compiler proves the new `MemoryCircuit` manifest's memory footprint is compatible with the current tier allocation, so the swap does not require rebalancing any existing circuit's memory. If it is not compatible — if the new version requires more `task` tier than is currently reserved — it is a compile error before deployment. The kernel update either passes the compatibility check at compile time and swaps cleanly at runtime, or it fails before the first byte is deployed. There is no "the kernel update failed mid-way" scenario. The compatibility proof either exists or the update is not attempted.
+
 ### Booting Is Two Steps: Add the Runtime, Then Add the Kernel Circuits
 
 Boot is not a special phase. It is two sequential applications of the same primitive, performed once at power-on.
