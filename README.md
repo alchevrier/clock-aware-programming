@@ -116,12 +116,12 @@ The ADRs record implementation decisions for the near-term Rust prototype (`Chan
 
 ## Implementation Roadmap
 
-The prototype target is a **Raspberry Pi 3B** — Cortex-A53 (ARMv8-A), 4 cores, bare metal. No Linux. No FPGA. The model runs on commodity hardware that anyone can buy for $35.
+The prototype target is a **Raspberry Pi 3B+** — Cortex-A53 (ARMv8-A), 4 cores at 1.4GHz, bare metal. No Linux. No FPGA. The model runs on commodity hardware that anyone can buy for $35.
 
 **Phase 0 — Compiler → manifest**
 Parse the core keywords, walk the instruction graph, derive `budget_ticks` per circuit against the Cortex-A53 instruction latency table (ARM Software Optimization Guide). Run the admission test: `Σ budget_ticks ≤ epoch_cycles` per core. Emit a manifest. The feed handler circuit compiles and produces a valid manifest. Target architecture: `aarch64-unknown-none`.
 
-**Phase 1 — Runtime on Pi 3B, bare metal**
+**Phase 1 — Runtime on Pi 3B+, bare metal**
 Manifest loader. Dispatch table per core. Channel regions pre-allocated in SDRAM from the manifest. Four circuits, nothing more:
 
 - `StorageCircuit` — reads a NASDAQ ITCH data file from SD card, writes one record per window to `channel NasdaqRecord`
