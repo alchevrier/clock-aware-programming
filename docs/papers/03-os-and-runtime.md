@@ -212,6 +212,8 @@ The runtime is not a separate thing that sits between the language and the kerne
 
 The operating system is not a special-privileged process. It is a collection of declared-timing circuits, written in the language, compiled by the same toolchain, verified by the same compiler. Apart from the ~500 lines of Assembly stubs that handle boot and hardware initialisation, every line of the OS is a function or a class with a `@Timeslice` annotation, a lifetime type, and a channel subscription list.
 
+Put precisely: **the kernel is a circuit whose driving input is `channel CPUClockTick`.** Every other event in the system — a packet arriving, a value crossing a threshold, a circuit completing its window — is a consequence of that one signal propagating through the dispatch table. There is no other source. There is no other entry point. The clock ticks; the kernel advances; circuits execute; channels carry the results forward. The entire execution model reduces to that chain.
+
 There is no privileged mode at the language level. The distinction between an OS circuit and an application circuit is the channel subscription list: OS circuits subscribe to hardware-backed channels (`channel IrqSignal`, `channel TimerTick`, `channel DmaCompletion`); application circuits subscribe to logical channels (`channel NicFrame`, `channel OrderDecision`). The language is the same. The compiler is the same. The four rules are the same.
 
 ### Handoff: Declared Cycle Boundaries, Not Locks
