@@ -1249,6 +1249,23 @@ The compiler detects when this proof holds and emits it into the manifest as a g
 
 When the hot-path working set does not fit in L1 — a larger order book, a wider price table — the compiler falls back to L2, then declares which values must be demoted to `session` tier (DRAM). The programmer sees the compile-time footprint report. They can choose to split the circuit, reduce the working set, or accept the DRAM latency and widen the budget accordingly. The decision is explicit, informed by exact numbers, made before the system ships.
 
+**The runtime's own overhead is included in the footprint at compile time.** The runtime accesses its own data structures on every dispatch loop iteration: the dispatch table entry for the current window, the manifest record for the upcoming circuit, the `early_fire` flag array, the observability delta write buffer. These are memory accesses. Their sizes are known at compile time — the runtime is compiled by the same toolchain against the same `cpu_model`. The compiler measures the runtime's own L1 footprint and includes it in the capacity check alongside the circuit data:
+
+```
+  Total L1 footprint check (hot path):
+
+  Circuit working set:     1628B   (channel data across hot-path chain)
+  Runtime dispatch data:    256B   (dispatch table window + manifest entry +
+                                    early_fire flags + observability buffer)
+  ─────────────────────────────
+  Total:                   1884B
+  L1 capacity:            32768B   (from system.cap)
+  Margin:                 30884B   ✓
+  hot_path_dram_loads:        0    (proved)
+```
+
+A proof that omits the runtime's footprint is not a proof — it is an optimistic estimate that fails the moment the runtime's own accesses evict a circuit's cache line. The compiler includes both because the runtime is not a privileged external entity that sits outside the memory model. It is code, compiled to instructions, accessing memory, counted in ticks and bytes the same as every circuit it runs. Its overhead was already accounted in the instruction budget (Step 2 above). Its memory footprint is accounted here. There is no hidden cost anywhere in the system.
+
 ### The Runtime Adapts — AI-Regulated OS
 
 The atom stream, the ML execution planner, and the clock model assignment together form a system that adapts in real time to the actual workload — not by guessing, not by sampling, but by reading a hardware-sourced proof stream and acting on it within the constraints of the compiler's theorems.
