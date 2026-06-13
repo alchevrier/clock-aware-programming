@@ -269,6 +269,23 @@ Using a `cold T` type anywhere in a branch is sufficient for the inference — t
 
 This is what replaces `__builtin_expect` and `[[likely]]`/`[[unlikely]]` hints in C++. Those are hints the compiler may or may not respect. In the clock-aware model, path priority is a type-level property with a timing contract: the compiler proves the cold path cannot violate the hot path's budget, or rejects the programme. Observability, logging, and background maintenance become structurally isolated from the main pipeline — not by discipline, but by construction.
 
+### The Channel — A Named Memory Region with One Producer
+
+**A channel is a typed, bounded memory region that exactly one circuit writes to, and that any declared subscriber reads from.** That is the complete definition. Everything else about channels — the wire metaphor, the ring buffer structure, the flip-flop analogy, the physical backing — follows from this one fact.
+
+The producer writes. It has no knowledge of its subscribers. It does not address them, invoke them, or know how many of them exist. It writes into the declared region and closes its window. The compiler knows the subscribers — from the channel subscription graph declared at compile time — and uses that knowledge to prove timing, resolve physical backing, and build the dispatch table. The producer's ignorance of its subscribers is not a limitation. It is the property that makes the system composable: adding a new subscriber — a monitoring circuit, an analytics circuit, a shadow copy — requires no change to the producer. The producer's contract is the channel declaration. The subscribers take it from there.
+
+This single definition reconciles the four faces of `channel` that appear throughout the language:
+
+| Appearance | What it is | Why it follows |
+|---|---|---|
+| **Wire** | The ownership graph: one producer, zero or more declared subscribers, no other path for data to travel | Follows from "one circuit writes, declared subscribers read" — the graph of those relationships is the wire graph |
+| **Ring buffer** | The physical form when `size > 1`: a contiguous array of `element` slots, indexed by `writeAccessPattern` and `readAccessPattern` | Follows from `size` being declared — the compiler allocates exactly `size × sizeof(element)` bytes in the declared `tier` |
+| **Flip-flop** | A `circuit`-internal channel with `size = 1` whose subscriber is the same circuit — it reads its own last write at the next window boundary | Follows from "declared subscriber can be the owning circuit itself"; `size = 1` means only the most recent value is retained |
+| **Physical allocation** | Register / L1 / L2 / DRAM / network, resolved by the compiler from `tier` + `size` + machine topology | Follows from the compiler knowing the full subscriber set and the declared `tier` — it assigns the physical backing that satisfies the timing proof |
+
+The channel's `size` declaration is therefore not optional and never a hint. It is the bound that makes the timing proof possible. A channel of unknown size would have an unknown memory footprint, an unknown access cost, and an unknown eviction probability — none of which the compiler can prove. Declaring `size` is declaring the contract. The compiler checks that the producer's write rate never fills the channel faster than the declared set of subscribers can drain it. If it does, the programme does not compile.
+
 ### Array-Based Standard Library
 
 Every collection in the standard library is array-backed. There are no linked lists. No tree nodes allocated on the heap. No hash map buckets chained through pointers. No `Vec<Box<T>>`. The standard library does not offer these structures — not because they are forbidden by a rule, but because they are inexpressible without `new` and pointer indirection, which do not exist.
