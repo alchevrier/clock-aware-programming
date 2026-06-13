@@ -127,9 +127,10 @@ Manifest loader. Dispatch table per core. Channel regions pre-allocated in SDRAM
 - `StorageCircuit` — reads a NASDAQ ITCH data file from SD card, writes one record per window to `channel NasdaqRecord`
 - `FeedHandlerCircuit` — reads `channel NasdaqRecord`, processes each record (parse, book update), writes result to `channel BookSnapshot`
 - `ClockCircuit` — wraps `CNTPCT_EL0`, timestamps each circuit window entry and exit
-- `ObservabilityCircuit` — reads timestamps, accumulates per-record cycle counts, computes p50 / p99 / p99.9 distribution
+- `ObservabilityCircuit` — reads timestamps, accumulates per-record cycle counts, computes p50 / p99 / p99.9 distribution, writes results to `channel DisplayLine`
+- `DisplayCircuit` — owns the HDMI framebuffer as a `permanent` channel, renders `channel DisplayLine` writes as text pixels
 
-At end of file: UART output of the percentile results alongside the manifest-predicted `budget_ticks`. The question the benchmark answers: **did the model predict the latency correctly?**
+At end of file: the percentile results are written to `channel DisplayLine`. `DisplayCircuit` owns the HDMI framebuffer (allocated via the VideoCore mailbox at boot, mapped as a `permanent` channel) and renders the values directly to screen. Plug in HDMI, power on, see results. No serial cable. No second machine. No terminal emulator. **The question the benchmark answers: did the model predict the latency correctly?**
 
 **Phase 2 — Kernel circuits promoted**
 `ClockCircuit`, `StorageCircuit`, and `MemoryCircuit` become declared kernel circuits running on the same dispatch table as the application circuits, indistinguishable by the runtime. The swap protocol demonstrated live: replace `StorageCircuit` without stopping execution.
