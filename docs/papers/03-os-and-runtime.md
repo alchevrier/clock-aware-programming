@@ -1391,6 +1391,37 @@ The OS-on-one-core topology reinforces this. The runtime's management accesses (
 
 This is why single-core clock-aware outperforms multi-threaded conventional for the same pipeline. Not because it runs faster instructions. Because it never stalls. A CPU that never stalls on memory has no need for thread switching to hide those stalls. The performance comes from eliminating the problem, not from compensating for it faster.
 
+### What the Programmer Declares. What the Compiler Owns.
+
+Every mechanism discussed in this paper — dispatch tables, epoch periods, pipeline fill costs, register forwarding, speculative regions, L1 footprint proofs, prefetch issuance, power mode transitions, early_fire promotion, cross-core coherency gaps — is the compiler's responsibility, not the programmer's.
+
+The programmer declares three things:
+
+1. **What the data is** — the channel element type, concrete and named.
+2. **How long it lives** — the lifetime tier: `register`, `ephemeral`, `task`, `session`, `permanent`, or `cold`.
+3. **When the circuit runs** — the `@Timeslice` annotation: which core, what period, what budget.
+
+Everything else follows from those declarations. Threading does not exist as a concept the programmer manages — circuits execute in their declared windows and the compiler proves they do not conflict. Concurrency does not exist as a problem the programmer solves — data flow is through channels with declared ordering, and the compiler proves every handoff arrives before it is read. Pipelining is not something the programmer constructs — the compiler arranges consecutive windows on the same core with register forwarding between them. Cache management is not something the programmer controls — the lifetime tier is the cache tier, and the runtime pre-positions every value before its window opens.
+
+The programmer never thinks about any of this unless she has a **critical path** that is approaching its declared budget. In that case the compiler tells her exactly why: which instruction sequence is the bottleneck, how many ticks it costs, how much margin remains, and which remedies are available (narrow a type, split a circuit, promote to a shorter-period window, move to a core with a larger L1). The information is exact. The decision is hers. The implementation of the decision — register reuse, speculative pipeline, cross-core placement — is again the compiler's.
+
+```
+  Programmer's cognitive model:
+
+  "What is this data?"          → val element = Price
+  "How long does it live?"      → val tier    = task
+  "When does this circuit run?" → @Timeslice(core = 2, period = "1.2us", budget = "800ns")
+
+  Compiler's cognitive model (invisible to programmer unless budget exceeded):
+
+  pipeline fill cost    register forwarding    speculative regions
+  L1 footprint check    prefetch scheduling    cross-core coherency gap
+  dispatch table slot   early_fire flag bit    power mode transition
+  epoch period ordering handoff proof          DRAM load count proof
+```
+
+The conventional alternative requires the programmer to manage all of the right column explicitly and correctly, under time pressure, with tools that measure rather than prove, on a system that is simultaneously running an OS whose timing is unknown. The clock-aware model moves the entire right column into the compiler. The programmer writes declarations. The compiler writes proofs. The hardware executes them.
+
 Cores 1–N run application circuits exclusively. Their L1 holds only circuit data — declared channel buffers, task-tier values, the working set the compiler proved fits. No runtime data structure ever touches their cache. No dispatch loop instruction ever runs on them. They receive a single ACP cache-line EXECUTE signal from core 0 at the start of each window, execute their declared instruction sequence, and return to `STANDBYWFI`. Their entire L1 budget belongs to the application.
 
 ```
