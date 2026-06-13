@@ -1282,6 +1282,20 @@ system.cores.app = [1, 2, 3, 4] // all remaining cores: application circuits onl
 
 Core 0 runs everything the OS needs: `ClockCircuit`, `MemoryCircuit`, `NicCircuit`, `ObservabilityCircuit`, the runtime dispatch loop, `early_fire` flag scanning, power mode management, prefetch issuance, ACP EXECUTE signals to application cores. Its L1 holds all runtime state. It runs at `Efficiency` frequency — counter reads, flag scans, and management signals do not require 4 GHz.
 
+The OS core's L1 is itself subject to the same compile-time footprint discipline as application cores. The compiler identifies which kernel elements are on the critical path — accessed on every WATCH iteration — and proves they are always L1-resident:
+
+| Critical element | Size | Access frequency | Must be L1-resident |
+|---|---|---|---|
+| Dispatch table hot window (next N entries) | N × 32B | Every WATCH iteration | Yes |
+| `early_fire` flag array | 1 bit per circuit slot | Every WATCH iteration | Yes |
+| Manifest records for next N circuits | N × 128B | Per PLAN transition | Yes |
+| ACP EXECUTE signal buffer | 64B (one cache line) | Per window boundary | Yes |
+| Observability delta write buffer | 256B | Per EVALUATE transition | Yes |
+
+The compiler computes the total footprint of these structures — determined by the number of circuit slots N declared in `system.cap` — and checks it against the OS core's L1 capacity. If it fits, every WATCH iteration reads only from L1. No L2 access, no latency penalty, no degradation in `early_fire` scan speed. If it does not fit, the compiler reports the overflow and the remedy: reduce N (fewer simultaneous circuit slots), widen the OS core's declared L1 (a `system.cap` hardware declaration), or split the dispatch table across two OS cores.
+
+The `early_fire` flag array is the most latency-sensitive element. It is scanned on every WATCH iteration and its result determines IRQ response time. A flag array that spills to L2 adds L2 latency — typically 4–12 ticks — to every scan. On a 4 GHz core that is 1–3 ns added to the worst-case IRQ response bound, which the compiler reports as a change to the proved `irq_response_ticks` constant in the manifest. Nothing is hidden. The footprint is declared. The latency consequence is computed. The programmer sees both.
+
 Cores 1–N run application circuits exclusively. Their L1 holds only circuit data — declared channel buffers, task-tier values, the working set the compiler proved fits. No runtime data structure ever touches their cache. No dispatch loop instruction ever runs on them. They receive a single ACP cache-line EXECUTE signal from core 0 at the start of each window, execute their declared instruction sequence, and return to `STANDBYWFI`. Their entire L1 budget belongs to the application.
 
 ```
