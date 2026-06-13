@@ -1188,6 +1188,17 @@ ARM cores expose a structured set of power modes. The runtime manages these as a
 
 The consequence is that the runtime's power consumption tracks the declared workload exactly. An idle system consumes only the power of the `ClockCircuit` and `ObservabilityCircuit` — everything else is in Standby or Dormant. A burst of hot-path circuits brings the required hot cores to On and leaves the cold cores in Dormant. The transition is provable from the dispatch table, not measured after the fact.
 
+**Tick-by-tick regulation from dispatch table lookahead.** Every decision the runtime makes about power, cache, and frequency is derived from reading the dispatch table forward in time — not from sampling current conditions and reacting. Because the table is a compile-time static structure, the runtime always knows exactly what will execute N ticks from now. This converts every management action from reactive to predictive:
+
+| Management action | Conventional OS | Clock-aware runtime |
+|---|---|---|
+| Core power mode transition | Triggered by load measurement after the fact | Issued exactly `wake_latency_ticks` before the circuit that needs the core |
+| Cache pre-warm / prefetch | Hardware prefetcher guesses from past access patterns | Issued during WATCH at the exact tick the manifest says the next circuit's footprint should be in L1 |
+| Frequency pre-conditioning | DVFS governor samples utilisation and ramps up reactively, often too late | Issued one window before the burst the dispatch table shows arriving |
+| `early_fire` IRQ promotion | Scheduler runs, classifies interrupt, context-switches | Flag checked on every WATCH iteration; promoted circuit executes at next window boundary |
+
+The dispatch table is therefore not just a schedule — it is the runtime's complete view of the future. Every tick the runtime spends in WATCH is a tick it uses to read that future and act on it precisely. A conventional OS operates in the present, reacting to events as they arrive. The clock-aware runtime operates in the declared future, preparing for events before they arrive. The difference is the dispatch table: a static proof of what will happen, available to the runtime at every tick, consulted on every loop iteration.
+
 ### The Runtime Adapts — AI-Regulated OS
 
 The atom stream, the ML execution planner, and the clock model assignment together form a system that adapts in real time to the actual workload — not by guessing, not by sampling, but by reading a hardware-sourced proof stream and acting on it within the constraints of the compiler's theorems.
