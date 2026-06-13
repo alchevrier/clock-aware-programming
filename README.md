@@ -119,10 +119,17 @@ The ADRs record implementation decisions for the near-term Rust prototype (`Chan
 The prototype target is a **Raspberry Pi 3B** — Cortex-A53 (ARMv8-A), 4 cores, bare metal. No Linux. No FPGA. The model runs on commodity hardware that anyone can buy for $35.
 
 **Phase 0 — Compiler → manifest**
-Parse the core keywords, walk the instruction graph, derive `budget_ticks` per circuit against the Cortex-A53 instruction latency table (ARM Software Optimization Guide). Run the admission test: `Σ budget_ticks ≤ epoch_cycles` per core. Emit a manifest. The price feed circuit from Paper II compiles and produces a valid manifest. Target architecture: `aarch64-unknown-none`.
+Parse the core keywords, walk the instruction graph, derive `budget_ticks` per circuit against the Cortex-A53 instruction latency table (ARM Software Optimization Guide). Run the admission test: `Σ budget_ticks ≤ epoch_cycles` per core. Emit a manifest. The feed handler circuit compiles and produces a valid manifest. Target architecture: `aarch64-unknown-none`.
 
 **Phase 1 — Runtime on Pi 3B, bare metal**
-Manifest loader. Dispatch table per core. Channel regions pre-allocated in SDRAM from the manifest. ARM generic timer (`CNTPCT_EL0`) as the clock source. The price feed circuit runs — reads from a file, processes records, produces output — with no OS beneath it. Cycle counts measured over UART against manifest predictions.
+Manifest loader. Dispatch table per core. Channel regions pre-allocated in SDRAM from the manifest. Four circuits, nothing more:
 
-**Phase 2 — Kernel circuits**
-`ClockCircuit` wraps the ARM generic timer. `MemoryCircuit` owns SDRAM region assignment. `StorageCircuit` reads from SD card — the filesystem analogue. The system is full-stack: application circuits and kernel circuits running on the same dispatch table, indistinguishable by the runtime. The same swap protocol demonstrated live: replace a kernel circuit binary without stopping execution.
+- `StorageCircuit` — reads a NASDAQ ITCH data file from SD card, writes one record per window to `channel NasdaqRecord`
+- `FeedHandlerCircuit` — reads `channel NasdaqRecord`, processes each record (parse, book update), writes result to `channel BookSnapshot`
+- `ClockCircuit` — wraps `CNTPCT_EL0`, timestamps each circuit window entry and exit
+- `ObservabilityCircuit` — reads timestamps, accumulates per-record cycle counts, computes p50 / p99 / p99.9 distribution
+
+At end of file: UART output of the percentile results alongside the manifest-predicted `budget_ticks`. The question the benchmark answers: **did the model predict the latency correctly?**
+
+**Phase 2 — Kernel circuits promoted**
+`ClockCircuit`, `StorageCircuit`, and `MemoryCircuit` become declared kernel circuits running on the same dispatch table as the application circuits, indistinguishable by the runtime. The swap protocol demonstrated live: replace `StorageCircuit` without stopping execution.
