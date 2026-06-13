@@ -591,7 +591,24 @@ The clock-aware kernel has one event type: a `CLKIN` tick. That tick advances th
 
 **IRQs become channel writes, not control-flow transfers.** In a conventional kernel, a hardware interrupt preempts whatever is running, transfers control to an interrupt handler, executes the handler, then returns — stealing an unknown number of cycles from the interrupted task with no attribution. The task had no say. It did not know. In the clock-aware model, the hardware signal — a NIC DREQ, a timer assertion, a device ready line — writes to a declared channel via DMA. It does not preempt anything. Control never transfers. The CPU does not jump to a handler. The interrupt becomes data at a physical address, and the dispatch table delivers it to the correct circuit — the networking stack, the timer circuit, the device driver — at the correct declared tick, in priority order.
 
-Priority is expressed through window ordering in the dispatch table, not through interrupt priority levels. A high-priority circuit like `NicCircuit` is assigned an earlier window in each tick epoch than a low-priority circuit like `ObservabilityCircuit`. When both have pending channel data, the dispatch table fires `NicCircuit` first by construction — not by a runtime priority decision, but because its window was declared earlier. The compiler proved the ordering. The clock enforces it. The concept of an interrupt priority level (`IRQL`, ARM GIC priority) is replaced entirely by declared window position. IRQ priority is a runtime mechanism for deciding who gets the CPU when multiple signals arrive simultaneously. Declared window position makes that decision at compile time, permanently, provably.
+Priority is expressed through two orthogonal declarations in `@Timeslice`, not through interrupt priority levels:
+
+**Window position within an epoch** — which circuit fires first when multiple circuits share the same epoch. `NicCircuit` is assigned tick 0; `ObservabilityCircuit` is assigned a later position. When both happen to be due at the same epoch boundary, `NicCircuit` executes first by construction.
+
+**Epoch period** — how often a circuit's window repeats. This is the dominant mechanism for responsiveness. `NicCircuit` declares a short period (e.g. every 4800 ticks at 4 GHz = 1.2 µs, matching the 10 Gbps frame arrival rate). `ObservabilityCircuit` declares a long period (300 million ticks = 100 ms). The dispatch table repeats each circuit at its declared interval:
+
+```
+tick        0: NicCircuit          (period: 4800 ticks)
+tick        6: parsePrice          (period: 4800 ticks)
+tick     4800: NicCircuit          (repeats)
+tick     4806: parsePrice          (repeats)
+...
+tick 36_000_000: ObservabilityCircuit  (fires once per 100 ms)
+```
+
+When a network packet arrives via DMA at tick 2400, it writes to `channel EthernetFrame` and waits. The maximum time before `NicCircuit` picks it up is one `NicCircuit` period — 4800 ticks, 1.2 µs. The packet does not wait for `ObservabilityCircuit`. It does not wait for anything with a longer period. The worst-case latency for any event is bounded by the epoch period of the circuit that consumes it — a compile-time constant declared in `@Timeslice`, proved to fit in the dispatch table, known before the first packet arrives.
+
+This is what replaces ARM GIC priority levels and Linux `IRQL`. In a conventional kernel, interrupt priority is a runtime arbitration mechanism — when two IRQs fire simultaneously, the higher-priority one runs first. In the clock-aware model there is no simultaneous arbitration because there is no preemption. The packet data is in the DMA buffer at its declared physical address; it is not going anywhere. `NicCircuit`'s next window is already in the dispatch table at a known tick. The maximum wait is the epoch period. The epoch period was declared by the programmer and proved by the compiler. The concept of "serving the network packet first" is expressed as declaring `NicCircuit` with a short period — not by elevating its interrupt priority at runtime.
 
 ### The Runtime Dispatch Loop — A Finite State Machine
 
