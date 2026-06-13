@@ -1199,6 +1199,25 @@ The consequence is that the runtime's power consumption tracks the declared work
 
 The dispatch table is therefore not just a schedule — it is the runtime's complete view of the future. Every tick the runtime spends in WATCH is a tick it uses to read that future and act on it precisely. A conventional OS operates in the present, reacting to events as they arrive. The clock-aware runtime operates in the declared future, preparing for events before they arrive. The difference is the dispatch table: a static proof of what will happen, available to the runtime at every tick, consulted on every loop iteration.
 
+**The channel graph gives the runtime causal foreknowledge — not just temporal.** The dispatch table answers *when*. The channel graph answers *why* and *what follows*. Because every data dependency in the system is a declared channel connection — there are no other data paths — the compiler produces a complete causal graph alongside the dispatch table: circuit A produces to `channel Price` → circuit B consumes `channel Price`, produces to `channel OrderBook` → circuit C consumes `channel OrderBook`. Every link in that chain is known before tick 0. The runtime holds both structures simultaneously:
+
+```
+  Temporal foreknowledge (dispatch table):
+  tick 0:    NicCircuit         fires
+  tick 6:    parsePrice         fires
+  tick 18:   updateBook         fires
+  tick 28:   riskCheck          fires
+
+  Causal foreknowledge (channel graph):
+  NicCircuit    → channel EthernetFrame → parsePrice
+  parsePrice    → channel Price         → updateBook, riskCheck
+  updateBook    → channel OrderBook     → emitQuote
+```
+
+Together these tell the runtime something no conventional OS can know: not just that `updateBook` will run at tick 18, but that it will run *because* `parsePrice` produced a value to `channel Price` at tick 6, and that its output will be consumed by `emitQuote` at tick 28. The full instruction chain — from NIC frame arrival to quote emission — is declared, causal, and known in its entirety before any packet arrives.
+
+This is what makes the prefetching exact rather than speculative. The runtime does not prefetch `updateBook`'s working set because it guesses `updateBook` might run soon. It prefetches it because the channel graph proves that `parsePrice`'s output will flow to `updateBook`, and the dispatch table proves `updateBook` opens at tick 18. Both facts are compile-time theorems. The prefetch is their logical consequence, issued at the exact tick the manifest says it must be issued to be ready. The runtime is not predicting. It is executing a proof.
+
 ### The Runtime Adapts — AI-Regulated OS
 
 The atom stream, the ML execution planner, and the clock model assignment together form a system that adapts in real time to the actual workload — not by guessing, not by sampling, but by reading a hardware-sourced proof stream and acting on it within the constraints of the compiler's theorems.
