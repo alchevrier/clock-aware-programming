@@ -111,3 +111,18 @@ The ADRs record implementation decisions for the near-term Rust prototype (`Chan
 | [0008](docs/adr/0008-clock-aware-memory-management.md) | Clock-aware memory management | Accepted |
 | [0009](docs/adr/0009-implied-hardware-architecture.md) | The implied hardware architecture | Speculative |
 | [0010](docs/adr/0010-channel-based-io.md) | Channel-based I/O — hardware signals as declared-timing channels | Accepted |
+
+---
+
+## Implementation Roadmap
+
+The prototype target is a **Raspberry Pi 3B** — Cortex-A53 (ARMv8-A), 4 cores, bare metal. No Linux. No FPGA. The model runs on commodity hardware that anyone can buy for $35.
+
+**Phase 0 — Compiler → manifest**
+Parse the core keywords, walk the instruction graph, derive `budget_ticks` per circuit against the Cortex-A53 instruction latency table (ARM Software Optimization Guide). Run the admission test: `Σ budget_ticks ≤ epoch_cycles` per core. Emit a manifest. The price feed circuit from Paper II compiles and produces a valid manifest. Target architecture: `aarch64-unknown-none`.
+
+**Phase 1 — Runtime on Pi 3B, bare metal**
+Manifest loader. Dispatch table per core. Channel regions pre-allocated in SDRAM from the manifest. ARM generic timer (`CNTPCT_EL0`) as the clock source. The price feed circuit runs — reads from a file, processes records, produces output — with no OS beneath it. Cycle counts measured over UART against manifest predictions.
+
+**Phase 2 — Kernel circuits**
+`ClockCircuit` wraps the ARM generic timer. `MemoryCircuit` owns SDRAM region assignment. `StorageCircuit` reads from SD card — the filesystem analogue. The system is full-stack: application circuits and kernel circuits running on the same dispatch table, indistinguishable by the runtime. The same swap protocol demonstrated live: replace a kernel circuit binary without stopping execution.
