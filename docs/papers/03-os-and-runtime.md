@@ -1310,6 +1310,25 @@ The `early_fire` flag array is the most latency-sensitive element. It is scanned
 
 Every size in that table is a product of two compile-time constants from `system.cap`. The compiler knows the total byte count of the entire OS before emitting a single instruction. The L1 footprint check is integer arithmetic over known constants. The result is either "fits" or "does not fit by N bytes" — not a measurement, not a profile, not a heuristic. A theorem over declarations.
 
+**`max_circuit_slots` is a ceiling, not an expectation.** The dispatch table is sized for the maximum number of concurrently active circuits declared in `system.cap`. But circuits are not independent — they are dependency chains. A circuit is absent from the dispatch table when its input channel has no data. Because all data flow is through declared channels, the absence of data at the head of a chain cascades: if `NicCircuit` has no frame to deliver, `parsePrice` has no Price to produce, `updateBook` has no OrderBook to update, `emitQuote` has no Quote to emit. Four slots clear simultaneously from one empty channel.
+
+The effective dispatch table occupancy at any moment is bounded by the number of currently active chains multiplied by their average length — not by `max_circuit_slots`. On a quiet system with no incoming packets, the table contains only the kernel circuits (`ClockCircuit`, `ObservabilityCircuit`, and whatever background work is declared) — a handful of entries regardless of how large `max_circuit_slots` is. On a burst, the full active chain appears. Between bursts, it collapses back to the kernel floor.
+
+```
+  max_circuit_slots = 64   (declared in system.cap)
+
+  Quiet system (no packets):
+    active: ClockCircuit, ObservabilityCircuit = 2 slots occupied
+
+  Single packet burst (one chain fires):
+    active: NicCircuit → parsePrice → updateBook → emitQuote
+            + kernel floor = 6 slots occupied
+
+  Effective peak occupancy for this workload: 6 / 64 = ~9%
+```
+
+The `max_circuit_slots` declaration therefore does not bound performance — it bounds the worst-case OS data structure size and the worst-case L1 footprint check. The actual runtime occupancy is determined by the arrival rate of data at chain heads, which is a property of the workload, not of the system configuration. The system is sized for the declared maximum; it operates at the workload's natural occupancy, which is always less.
+
 Cores 1–N run application circuits exclusively. Their L1 holds only circuit data — declared channel buffers, task-tier values, the working set the compiler proved fits. No runtime data structure ever touches their cache. No dispatch loop instruction ever runs on them. They receive a single ACP cache-line EXECUTE signal from core 0 at the start of each window, execute their declared instruction sequence, and return to `STANDBYWFI`. Their entire L1 budget belongs to the application.
 
 ```
