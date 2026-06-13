@@ -615,6 +615,10 @@ The runtime's dispatch loop is a finite state machine. Four states repeat every 
 
 The FSM has no transitions that go from EXECUTE back to PLAN mid-window. A circuit that exceeds its declared budget is a compile-time impossibility — if it compiled, the compiler proved it fits. The FSM is deterministic by construction.
 
+**A circuit waiting for data generates no instructions.** In a conventional OS, an application waiting for network data calls `recv()`, blocks on a socket, and is put to sleep by the scheduler — a context switch out, a wait queue entry, a wakeup later, a context switch back in. All of that has cost: saving register state, scheduling overhead, cache eviction, TLB state loss, wakeup latency. The application is present in the system as a sleeping task consuming memory and scheduler state, doing nothing, waiting to be woken.
+
+In the clock-aware model, a circuit whose input channel has no data simply has no window in the dispatch table for that tick. It is not sleeping. It is not spinning. It is not in a wait queue. It generates no instructions to the CPU because it does not appear in the dispatch table at all. No register state to save. No cache eviction. No wakeup mechanism. No scheduler notification. The circuit is absent — not blocked, not sleeping, but structurally not present in that tick's execution. When data arrives into its declared channel, the dispatch table includes its window in the next applicable tick and it executes. The transition from absent to executing costs exactly the ticks between window boundaries — nothing more.
+
 ### How Cycles Work: What the Compiler Solves
 
 This is the mechanism. The question "how does the system actually run by cycles" has a precise answer at every level.
