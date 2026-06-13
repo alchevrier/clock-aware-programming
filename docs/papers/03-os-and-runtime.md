@@ -1347,6 +1347,28 @@ The epoch period of the chain head determines how much time the dispatch table h
 
 The video game case is instructive precisely because it is the hardest case for occupancy — yet even there the dispatch table is empty for more ticks than it is occupied. The frame cap is a declared epoch period: `@Timeslice(period = "16.67ms")` on the frame-head circuit. Every tick of that 16.67 ms is accounted for at compile time. The runtime knows that for the next 34 million ticks after the frame pipeline completes, no frame-chain circuit can fire. It uses that window to run background circuits — asset streaming, audio mixing, network state updates — at their own declared periods, filling the idle ticks with declared work rather than spinning. The dispatch table is never full because the chain head's epoch period guarantees a known-empty interval after every burst, and the compiler schedules background work into that interval explicitly. The frame cap is not a performance limit. It is a scheduling declaration that gives the compiler a provably large idle window to work with.
 
+**A single core with a single-threaded dispatch table delivers stellar performance.** In a conventional OS, single-core means time-slicing: threads compete for the CPU, each paying context-switch overhead at every quantum boundary — register save and restore, cache flush, TLB invalidation, scheduler decision, cache re-warm. The overhead is not optional. It is the cost of the scheduler not knowing what runs next.
+
+In the clock-aware model there is no context switch. There is only the dispatch table advancing one entry at a time. On a single core the pipeline stages run back-to-back: `parsePrice` completes, its output registers are forwarded directly to `updateBook`'s first instruction, `updateBook` completes, its L1-pinned output is read by `emitQuote`. The inter-window cost is `runtime_overhead_ticks` — the counter read and dispatch table advance, a handful of instructions, the same on one core or sixteen. No register save. No cache flush. No scheduler decision. The "threads" are consecutive dispatch table entries whose register state is forwarded rather than saved.
+
+```
+  Conventional OS, single core, 3 threads:
+
+  thread A runs ──► context switch (save A, load B) ──► thread B runs
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+                    ~1000–5000 ticks per switch
+                    cache cold, TLB partially invalidated
+
+  Clock-aware, single core, 3 circuit windows:
+
+  parsePrice ──► runtime_overhead (8 ticks) ──► updateBook ──► (8 ticks) ──► emitQuote
+                 ^^^^^^^^^^^^^^^^^
+                 counter read + dispatch table advance only
+                 registers forwarded, L1 hot, no save/restore
+```
+
+The single-core clock-aware system is faster than a multi-threaded conventional system for the same pipeline because it eliminates every source of inter-window overhead that multi-threading was supposed to hide. Multi-threading in a conventional OS exists to keep the CPU busy while one thread waits for I/O or memory. In the clock-aware model, the circuit is simply absent when its channel has no data — the core moves to the next dispatch table entry with no overhead. There is nothing to hide, nothing to overlap, nothing to context-switch around. The single core executes exactly what the compiler declared, in order, with the overhead the compiler counted, and nothing else.
+
 Cores 1–N run application circuits exclusively. Their L1 holds only circuit data — declared channel buffers, task-tier values, the working set the compiler proved fits. No runtime data structure ever touches their cache. No dispatch loop instruction ever runs on them. They receive a single ACP cache-line EXECUTE signal from core 0 at the start of each window, execute their declared instruction sequence, and return to `STANDBYWFI`. Their entire L1 budget belongs to the application.
 
 ```
