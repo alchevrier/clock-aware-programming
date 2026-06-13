@@ -125,6 +125,24 @@ Complexity is not just an engineering cost — it is a correctness risk. Every i
 
 A five-layer stack with two layers being the same thing has fewer interactions by construction. The interactions that remain — channel reads and writes — are typed and subscription-checked at compile time. A correct function cannot be composed incorrectly with another correct function: the channel types enforce the interface, and the subscription list in `system.cap` is the composition specification.
 
+### The Resilience Engineering Vocabulary Is Channel Arithmetic
+
+Senior engineers at high-scale organisations spend significant effort on a category of problems collectively called resilience engineering: rate limiting, backpressure, circuit breakers, bulkheads, timeout handling, retry budgets, cache warming, capacity planning, and shed load under saturation. These problems are discussed as if they are fundamental — hard enough to require dedicated teams, conference talks, and years of accumulated expertise.
+
+They are not fundamental. They are consequences of undeclared data flow and timing.
+
+**Rate limiting** is channel size. A service that accepts 1000 TCP requests per second is a circuit with a `channel TcpRequest { val size = 1000; val tier = session }` and a declared period of 1 ms. The compiler proves the NIC circuit cannot produce requests faster than the handler circuit can consume them at the declared period. If the declared rate is exceeded at the channel boundary, it is a compile error. The rate limiter is not middleware. It is not a Redis-backed token bucket. It is the `size` declaration the programmer already wrote for other reasons.
+
+**Backpressure** is channel fullness. When a `channel TcpRequest` fills because the producer writes faster than the consumer drains, the producer's next `put` either blocks at the window boundary (the compiler-proved bound prevents overflow) or the compiler rejected the programme before deployment. There is no overflow. There is no dropped request. There is no backpressure *protocol* to implement — the channel model already enforces it structurally.
+
+**Timeout handling** is `channel Timeout`. A request that has not received a response within the declared window fires `channel Timeout` from the `ClockCircuit`. The handler circuit's exhaustive match must cover the `Timeout` arm. The compiler refuses to compile code that doesn't handle it. There is no unchecked timeout. There is no silent hang.
+
+**Circuit breakers** are `LockState` channels. A service that has failed too many times writes `Aborted` to its state channel. Downstream consumers see `Aborted` in their exhaustive match and route around it. The state is a channel. The routing is a match arm. The "circuit breaker" pattern is two lines.
+
+**Capacity planning** is the admission test: `Σ budget_ticks ≤ epoch_cycles` per core. The system's total capacity is a compile-time theorem derived from the manifest sums. Adding a circuit either passes the test or doesn't. The capacity is not a measurement taken from a production system under load and extrapolated with safety margins. It is a proof, computed before deployment, exact to the cycle.
+
+The expertise required to operate these patterns in a conventional system is real and hard-won. But it is expertise in compensation machinery — machinery that exists because the system did not declare what it was doing. Declare it, and the machinery has nothing left to do. A junior engineer writing `val size = 1000` and `@Timeslice(period = "1ms")` gets the same rate-limiting guarantee a senior engineer spent months building with Redis, Hystrix, and Envoy to approximate. The guarantee is not approximate. It is proved.
+
 ---
 
 ## The Complete Comparison
