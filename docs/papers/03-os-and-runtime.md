@@ -623,14 +623,14 @@ The runtime's dispatch loop is a finite state machine. Four states repeat every 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │                                                                 │
-│   IDLE ──► PLAN ──► EXECUTE ──► EVALUATE ──► IDLE (repeat)     │
+│   WATCH ──► PLAN ──► EXECUTE ──► EVALUATE ──► WATCH (repeat)   │
 │                                                                 │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-**IDLE — No pending signals.** The runtime does not spin. It uses idle ticks productively: organising the instruction sequence for the next window, speculating ahead in the dispatch table, pre-conditioning the `cpu_model` frequency for a declared burst, and managing cores with no assigned circuit this window — powering them down, assigning them cold-tier work, or pre-warming their caches ahead of the next declared hot-path entry.
+**WATCH — Between windows.** The runtime never truly idles. It spins continuously on the hardware counter (`CNTVCT_EL0` / `RDTSC`), reading it on every iteration of the dispatch loop. On each iteration it also scans the dispatch table for `early_fire` flags set by incoming `channel IrqSignal` writes. This scan cannot be deferred — deferring it would delay IRQ response by however long the runtime slept, defeating the nanosecond latency guarantee. The runtime has no sleep state. Between windows it uses every tick productively: issuing exact prefetches for the next circuit's declared memory footprint, pre-conditioning the `cpu_model` frequency for a declared burst, and managing cores with no assigned circuit this window — placing them in `STANDBYWFI` (which wakes on the next timer tick, not on an OS wakeup call) or pre-warming their caches. `STANDBYWFI` is not sleep in the OS sense: the core halts instruction retirement but the runtime's counter-read loop resumes the instant the next declared window tick arrives. The hardware wakes it; the runtime was already waiting at the counter.
 
-**PLAN — Signals present.** The runtime reads the dispatch table for the current tick. Which circuits fire this window? Can all declared channels be served? Are the circuits on HOT or COLD paths — determined from the trace history of previous executions, not from runtime guessing? What was the previous execution's actual cycle delta versus its declared budget? Which `cpu_model` applies to this core? The plan is not computed at this point — it was compiled. The runtime reads a static structure, not a dynamic queue.
+**PLAN — Next window identified.** An `early_fire` flag is set, or the counter has reached the next scheduled window boundary. The runtime reads the dispatch table entry. Which circuit fires this window — the normally scheduled one, or an `early_fire` promoted circuit? The plan is not computed at this point — it was compiled. The runtime reads a static structure, not a dynamic queue.
 
 **EXECUTE — Circuits run.** The CPU executes the declared instruction sequence within the declared window. The runtime observes via the trace unit. It does not intervene.
 
