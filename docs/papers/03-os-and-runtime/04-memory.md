@@ -149,6 +149,29 @@ There is no `VFS` layer. There is no `inode` table separate from the namespace. 
 
 The filesystem was always a cache manager bolted on top of block I/O with a namespace on top. When the cache manager is the runtime, the block I/O is the driver circuit, and the namespace is one more OS circuit, the filesystem disappears as a concept — and what remains is simpler, faster, and fully verified by the same compiler that verifies everything else.
 
+### Redis, LRU, and `mmap` — Infrastructure for Undeclared Timing
+
+Redis, LRU caches, and memory-mapped files are three different answers to the same question the OS cannot answer at compile time: *which data will be needed, when, and how fast must it be available?* Because the OS has no answer, it compensates at runtime. Each compensation mechanism introduces cost that appears nowhere in the code.
+
+**Redis** is an in-process cache outsourced to a separate process. The reason it exists as a separate process is that the application cannot trust that its working set will be in RAM — or even in page cache — when it is needed. The OS may have evicted it. The kernel may be under memory pressure from another process. The JVM's GC may have promoted the data to a cold generation. Redis solves this by keeping the data in its own process's address space, which the OS is less likely to evict because Redis declares its memory limit explicitly (`maxmemory`). Redis is a work-around for the OS not knowing that this data should be pinned. In the clock-aware model, `val tier = session` is that declaration — the compiler pins the channel's memory before the first window opens, the runtime never evicts it, and no separate process is needed. The network hop, the serialisation, the connection pooling, the eviction policy, the replication configuration — all eliminated. The data is pinned DRAM, present at the declared tier, always at the declared latency.
+
+**LRU** is a runtime eviction policy that approximates what the programmer should have declared. Least-recently-used assumes that access recency predicts future access — a heuristic that is sometimes correct and sometimes catastrophically wrong (a one-time sequential scan evicts the entire working set). The LRU cache exists because the programmer did not declare which data is hot and which is cold. In the clock-aware model, `val tier = task` (L1/L2, pinned for the window) and `val tier = session` (DRAM, resident) *are* that declaration. The compiler pins hot data in L1 for the duration of the window and proves it fits. The runtime pre-warms L1 from the dispatch table lookahead before the window opens. There is no eviction during the window — the compiler proved the footprint fits before emitting the binary. The LRU policy is replaced by a compile-time declaration. The programmer does not guess which data is hot; they declare it, and the compiler verifies it.
+
+**`mmap`** is the most seductive of the three because it looks free. `mmap(file, size)` returns immediately. The cost is paid later, invisibly, one 4KB page at a time: a page fault triggers a kernel entry, a TLB fill, a page table walk, a physical page allocation, a disk read, and a TLB shootdown on other cores. The access that caused the fault may have been a single `data[i]` load — indistinguishable in the code from an L1 hit. The actual cost ranges across five orders of magnitude:
+
+| Access scenario | Cycles at 4 GHz |
+|---|---|
+| L1 hit (page hot, TLB warm) | 4 |
+| L2/L3 hit (page in cache) | 12–40 |
+| TLB miss (page in RAM, TLB cold) | ~200–1,000 |
+| Page fault (page not in RAM) | ~100,000–10,000,000 |
+
+The code is identical in all four cases. The programmer has no way to know which one will occur at runtime — the OS's page eviction decisions are opaque, heuristic-driven, and vary with system load. `mmap` is therefore a performance lottery disguised as a zero-copy interface.
+
+In the clock-aware model there is no lottery. A `session`-tier channel with `size = N` is pre-allocated in physical DRAM at slot time — before the first instruction of the circuit executes. The memory is always physically resident. Page faults do not exist for `session` or `permanent` tier channels because the pages are never unmapped. TLB shootdowns do not occur because the kernel never reclaims the physical pages. The cost is paid once, at slot time, as a subtraction from the pre-allocated tier pool. From that point, every access to the channel is guaranteed to cost the declared tier latency — no variance, no lottery, no invisible kernel entry. A 10 MB price table in `session` tier costs 200–300 cycles the first time the circuit accesses it after a cold start (L3 miss bringing it to L2), and 4–12 cycles on every subsequent access in the same window (L1/L2 hit, prefetcher-primed from the declared access pattern). That is the complete cost profile. The compiler computed it. The manifest records it. The runtime enforces it.
+
+The deeper point is that Redis, LRU, and `mmap` are not different tools for different problems. They are three instances of the same compensation: a system that did not declare what data would be needed when is forced to guess at runtime, and guess wrong enough often enough that elaborate infrastructure is required to manage the guessing. Declare the data's tier and access window, and the infrastructure has nothing left to do.
+
 ### Atoms — The Audit and Adaptation Unit
 
 An **atom** is the smallest observable unit of execution in the clock-aware model: one circuit, one cycle window, one tick. Every instruction executed within that window, every register touched, every channel read or written — all of it is attributed to a single atom. The trace unit (see `### The Trace Unit`) emits one `TraceEvent` per atom.
