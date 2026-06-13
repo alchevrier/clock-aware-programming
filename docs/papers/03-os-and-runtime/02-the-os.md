@@ -222,6 +222,13 @@ The model addresses this through two mechanisms.
 
 The quiescent window for `MemoryCircuit` is short by design: the compiler proves the new `MemoryCircuit` manifest's memory footprint is compatible with the current tier allocation, so the swap does not require rebalancing any existing circuit's memory. If it is not compatible — if the new version requires more `task` tier than is currently reserved — it is a compile error before deployment. The kernel update either passes the compatibility check at compile time and swaps cleanly at runtime, or it fails before the first byte is deployed. There is no "the kernel update failed mid-way" scenario. The compatibility proof either exists or the update is not attempted.
 
+**Kernel evolution is two operations and only two.** A kernel update is either a **swap** — same channel profile, new implementation — or an **add** — new channel profile, new capability. There is no third operation. No kernel patch mechanism. No module reload with side effects. No reboot.
+
+- **Swap**: bug fix, performance improvement, algorithm change in an existing kernel circuit. The channel profile is identical. The compiler checks it. The dependency-ordered swap protocol applies. The system does not notice — same channels, same timing, new code.
+- **Add**: new OS capability (a new device driver, a new protocol circuit, a new observability sub-circuit). A new circuit with a new channel profile is slotted alongside the existing kernel circuits via the standard `add_circuit` call. No existing circuit is disturbed. The new circuit starts producing its channels at its next declared window boundary.
+
+Every Linux kernel update that requires a reboot does so because the kernel is a monolith — a single binary where changing one subsystem requires reloading the entire thing, and the new version's data structures are incompatible with the running state. Clock-aware kernel circuits have no shared data structures. Each circuit owns its channels. Each channel is typed and bounded. A new `MemoryCircuit` binary carries its own manifest and its own declared channel profile. The only question the swap protocol asks is: does the new manifest's channel profile match the old one? If yes, the swap proceeds. If no, it does not compile. The kernel is a collection of independent circuits. Updating one does not touch the others.
+
 ### Booting Is Two Steps: Add the Runtime, Then Add the Kernel Circuits
 
 Boot is not a special phase. It is two sequential applications of the same primitive, performed once at power-on.
