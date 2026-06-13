@@ -1477,6 +1477,51 @@ The clock-aware model brings the channel inside the program. Every value moves t
 
 Dispatching all circuits in a chain to the same core on an in-order processor is the final simplification. An in-order processor executes instructions in the order they are issued. Registers forwarded between windows are already in the pipeline. L1 loads hit in a fixed number of ticks counted by `llvm-mca`. There are no out-of-order reorderings to reason about, no store buffer drains to fence, no coherency protocol messages to wait for. Correctness is a consequence of declaration order and instruction order being the same thing. The memory model was the patch applied to a system where those two things had come apart. Reattach them and the patch is unnecessary.
 
+### The UML Sequence Diagram Is Finally Correct
+
+A UML sequence diagram shows actors as vertical lifelines and interactions as horizontal arrows. `NicCircuit` calls `parsePrice`. `parsePrice` calls `updateBook`. `updateBook` calls `emitQuote`. The diagram implies a definite sequence: these calls happen in this order, each completing before the next begins, the data flowing cleanly from left to right.
+
+In a conventional program this diagram is aspirational, not accurate. The programmer drew what she intended. What actually executes is different. Between any two arrows on the diagram the scheduler may preempt the thread and not resume it for 1–5 ms. A lock acquisition may put the thread to sleep for an unbounded duration while another thread holds it. A page fault may stall the thread while the kernel fetches a page from DRAM. An SMI fired by firmware may steal the CPU with no record left in any log. The sequence diagram cannot represent any of these events because none of them were declared — they are consequences of a runtime environment that the diagram has no notation for.
+
+The diagram is a fiction. It describes the intended interaction topology, not the actual execution sequence. Software architects have accepted this quietly for decades: the diagram is a communication tool, not a specification. It communicates structure. It does not specify timing, ordering guarantees, or correctness conditions under concurrent execution.
+
+**In the clock-aware model, the sequence diagram is the specification.** The circuit graph is the sequence diagram. Every arrow in the diagram corresponds to a declared channel with a proved coherency gap. Every lifeline corresponds to a circuit with a declared window measured in exact CLKIN ticks. Every interaction on the diagram executes in exactly the order shown, in exactly the window declared, with no unrepresented events between the arrows.
+
+```
+  UML sequence diagram in conventional program:
+
+  NicCircuit        parsePrice        updateBook        emitQuote
+      |                 |                 |                 |
+      |──────frame──────▶                 |                 |
+      |                 │  [scheduler may preempt here]     |
+      |                 │  [lock may sleep here]            |
+      |                 │  [SMI may fire here]              |
+      |                 ├──────price──────▶                 |
+      |                 |                 │  [page fault?]  |
+      |                 |                 ├──────quote──────▶
+      |                 |                 |                 |
+
+  The arrows are correct. Everything between them is unknown.
+
+  UML sequence diagram in clock-aware program:
+
+  NicCircuit        parsePrice        updateBook        emitQuote
+  [tick 0–200]     [tick 210–400]   [tick 410–600]   [tick 610–800]
+      |                 |                 |                 |
+      |──channel EthernetFrame──▶        |                 |
+      |    (gap: 10 ticks, proved)        |                 |
+      |                 |──channel Price──▶                 |
+      |                 |    (gap: 10 ticks, proved)        |
+      |                 |                 |──channel Quote──▶
+      |                 |                 |  (gap: 10 ticks, proved)
+      |                 |                 |                 |
+
+  The arrows are correct. Everything between them is also correct.
+  There is nothing between them.
+```
+
+The diagram is no longer aspirational. It is the compiled output. The compiler's Pass 1 walks the channel graph, verifies every coherency gap, and rejects the program if any arrow in the diagram cannot be proved to carry data before the next lifeline's window opens. What the architect drew is what the hardware executes. The notation that spent decades as a communication fiction becomes a formal verification artefact.
+
 Cores 1–N run application circuits exclusively. Their L1 holds only circuit data — declared channel buffers, task-tier values, the working set the compiler proved fits. No runtime data structure ever touches their cache. No dispatch loop instruction ever runs on them. They receive a single ACP cache-line EXECUTE signal from core 0 at the start of each window, execute their declared instruction sequence, and return to `STANDBYWFI`. Their entire L1 budget belongs to the application.
 
 ```
