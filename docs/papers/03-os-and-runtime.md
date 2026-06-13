@@ -1266,6 +1266,13 @@ When the hot-path working set does not fit in L1 — a larger order book, a wide
 
 A proof that omits the runtime's footprint is not a proof — it is an optimistic estimate that fails the moment the runtime's own accesses evict a circuit's cache line. The compiler includes both because the runtime is not a privileged external entity that sits outside the memory model. It is code, compiled to instructions, accessing memory, counted in ticks and bytes the same as every circuit it runs. Its overhead was already accounted in the instruction budget (Step 2 above). Its memory footprint is accounted here. There is no hidden cost anywhere in the system.
 
+**When the hot path spills, the runtime can move itself to a different core.** If the combined footprint — circuit working set plus runtime dispatch data — exceeds L1 capacity on the hot core, the compiler reports the spill and the available remedies in order:
+
+1. **Reduce the circuit's working set** — split the circuit, narrow a channel element type, demote a value to L2.
+2. **Assign the runtime's dispatch management to a dedicated cold core.** The hot core's L1 is then entirely reserved for circuit data. The runtime's dispatch loop executes on its own cold core — with its own L1, its own `cpu_model` (cold cores run at `Efficiency` frequency, sufficient for counter reads and flag scans), its own declared `@Timeslice` window. The hot core receives its EXECUTE trigger via a single cross-core signal from the runtime core — one cache-line-sized message, coherent via ACP, costing the declared cross-core latency gap. The hot core's L1 sees only circuit data. The runtime's accesses never appear in that cache.
+
+This is a natural application of the hot/cold core split already in `system.cap`. The runtime declares itself on a cold core the same way any other circuit is placed — `@Timeslice(core = 0, ...)` for the runtime dispatch loop, `@Timeslice(core = 2, ...)` for the hot-path circuits. The compiler re-runs the L1 footprint check with the runtime footprint removed from the hot core's capacity equation. If the hot-path working set now fits in L1 alone, `hot_path_dram_loads: 0` is restored. The proof holds again, at the cost of one cold core dedicated to runtime management — a cheap core, running at low frequency, doing a small fixed amount of work per tick.
+
 ### The Runtime Adapts — AI-Regulated OS
 
 The atom stream, the ML execution planner, and the clock model assignment together form a system that adapts in real time to the actual workload — not by guessing, not by sampling, but by reading a hardware-sourced proof stream and acting on it within the constraints of the compiler's theorems.
