@@ -673,6 +673,26 @@ When a network packet arrives via DMA at tick 2400, it writes to `channel Ethern
 
 This is what replaces ARM GIC priority levels and Linux `IRQL`. In a conventional kernel, interrupt priority is a runtime arbitration mechanism — when two IRQs fire simultaneously, the higher-priority one runs first. In the clock-aware model there is no simultaneous arbitration because there is no preemption. The packet data is in the DMA buffer at its declared physical address; it is not going anywhere. `NicCircuit`'s next window is already in the dispatch table at a known tick. The maximum wait is the epoch period. The epoch period was declared by the programmer and proved by the compiler. The concept of "serving the network packet first" is expressed as declaring `NicCircuit` with a short period — not by elevating its interrupt priority at runtime.
 
+**The runtime execution plan is not computed — it is read from the channel graph.** A general-purpose scheduler is complex because it must solve a resource allocation problem at runtime, without knowing task durations, without knowing data dependencies, without knowing which tasks will block and for how long. Every heuristic it uses — priority queues, CFS fairness weights, deadline-based ordering — is a compensating mechanism for not having that information.
+
+The clock-aware runtime has all of that information, statically, before the first instruction executes. The channel graph is the data dependency graph. It is a compile-time constant. The runtime does not need to discover which circuit depends on which — that is declared in the subscriptions and proved in Pass 1. The execution plan is therefore not an NP-hard bin-packing problem solved at runtime. It is a topological sort of the channel graph, performed once at compile time, stored in the dispatch table, and read back by the runtime one entry at a time.
+
+The only genuine scheduling decision the runtime faces is **arbitration between independent chains competing for application cores**. Two unrelated workloads — a trading pipeline and a risk aggregation pipeline — have no channel connections between them. The channel graph gives no ordering between them. This is the one case where a weighting mechanism is needed, and it is the simplest possible one: `@Timeslice` period is the weight. The shorter the period, the more frequently the chain head fires, the more app core time it consumes. A chain with a 1.2 µs period and a chain with a 100 ms period coexist on the same set of cores without interference because they occupy completely different tick ranges in the dispatch table. The compiler places them so their windows never overlap. When they do compete for the same window slot, the shorter-period chain takes precedence — it was declared to fire more urgently.
+
+```
+  Related circuits (channel graph gives order):
+  NicCircuit → parsePrice → updateBook → emitQuote
+  Ordering: topological sort of channel graph, compile-time, static
+
+  Unrelated circuits (no channel connection — weighting arbitrates):
+  TradingPipeline     (period: 1.2 µs)  ──► short period = high weight
+  RiskAggregation     (period: 10 ms)   ──► long period  = low weight
+  Arbitration: compiler places windows in non-overlapping slots;
+               shorter period takes precedence at any contended boundary
+```
+
+The runtime's dispatch loop is therefore simple: follow the channel graph for dependent chains, use period-as-weight for independent chains, apply `early_fire` promotions for incoming signals. Three rules. No heuristics. No priority queues to maintain. No scheduler state to update. The entire execution plan was computed once, at compile time, by the compiler walking the channel graph. The runtime executes it.
+
 **An IRQ signal promotes the consuming circuit to the top of the remaining dispatch table.** The epoch period is the worst-case latency bound — the maximum time a circuit waits if its channel receives data at the worst possible moment in its epoch. But a hardware signal that writes to a declared `channel IrqSignal` does more than deposit data. It also sets a single flag in the dispatch table entry for the consuming circuit: `early_fire = true`. The runtime's dispatch loop, at the close of the currently executing window — never mid-window, never preempting anything — reads that flag and inserts the signalled circuit's window immediately after the current one, ahead of whatever was next in the epoch. The circuit executes at the earliest clean window boundary after the signal arrived. Not at its normally scheduled epoch position. At the next available slot.
 
 This is the exact semantic of a hardware IRQ, expressed without preemption. A conventional IRQ says: stop what you are doing and serve me now. A `channel IrqSignal` says: finish what you are doing, then serve me before anything else. The difference is the absence of mid-window preemption — the current circuit always completes its declared window, because its budget was proved to fit, because violating that proof would invalidate every timing guarantee in the system. The signal waits at most one window boundary. Then it is at the top of the table.
