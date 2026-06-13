@@ -581,6 +581,12 @@ This is not an incremental optimisation. It is a transfer of responsibility from
 
 The scheduler exists to resolve contention between tasks whose timing is unknown. In a clock-aware system, there is no such contention — every function's window is declared non-overlapping. There is nothing to arbitrate. The "scheduler" in this model is the clock itself: functions execute at their declared cycles, in order, because the CPU executes the next instruction. No arbitration. No priority queue. No run queue. No preemption. The cycle annotation is the schedule; the hardware is the scheduler.
 
+**The entire kernel is event-driven. The only event is a clock tick.**
+
+Linux is driven by a mixture of events: timer IRQs, hardware IRQs, softirqs, syscalls, page faults, IPIs, SMIs. Each has its own entry path, its own latency, its own interaction with the scheduler. A task has no way of knowing which of these fired while it was nominally running, for how long, or how many times. When a Linux task calls `RDTSC` before and after a block of code, the delta includes all of it — scheduler preemption, IRQ handlers, TLB shootdowns, firmware SMIs — with no labels, no attribution, no way to recover the breakdown. The task knows it yielded when it called `schedule()`. At all other times, it has no knowledge of whether it was actually running.
+
+The clock-aware kernel has one event type: a `CLKIN` tick. That tick advances the dispatch table by one entry. The circuit whose window opens at that tick executes. There is no IRQ classification, no softirq backlog, no preemption decision, no run queue traversal. The tick fires; the dispatch table determines what runs; the circuit runs to its declared window boundary; the next tick fires. Every CPU cycle is attributed to exactly one declared circuit. There are no unaccounted cycles. A task cannot be preempted without its knowledge because preemption does not exist — a circuit runs its full declared window, atomically, from the perspective of the dispatch table. The atom stream in the `ObservabilityCircuit` is the proof: every tick on every core is labelled with the circuit that owned it. No tick is anonymous. No tick is lost.
+
 ### The Runtime Dispatch Loop — A Finite State Machine
 
 The runtime's dispatch loop is a finite state machine. Four states repeat every declared clock window:
