@@ -376,6 +376,10 @@ There is no separate collection model. There is no separate channel model. There
 
 The compiler sees one construct. The hardware sees one thing: a stride into a contiguous array.
 
+**Every data structure is a channel whose access pattern encodes the key-to-index mapping.** An array is a channel where the key *is* the index — `writeAccessPattern(i) = i`. A ring buffer is a channel where the key is a producer or consumer counter modulo size. A hash table is a channel where the key passes through a hash function. A sorted lookup table is a channel where `readAccessPattern` performs a binary search. A FIFO, a LIFO, a sliding window, a priority index — all are channels. The only variable is what arithmetic the access pattern applies to the key before producing a slot number.
+
+This means the programmer never chooses a data structure. They declare an element type, a size, a tier, and two functions. The *shape* of the access pattern *is* the data structure. Adding a new kind of container is declaring a new access pattern, not importing a library. The standard library's named collections — `ArrayDeque`, `FlatMap`, `SortedArray` — are simply named instances of this pattern that the programmer need not redeclare themselves.
+
 **The compiler derives `put`/`get` costs — no budget table needed.** Because every channel declaration includes `element`, `tier`, and `size`, the compiler has everything it needs to compute the exact cycle cost of `put` and `get` from first principles:
 
 - `tier` → cache level → access latency (from `system.cap`)
