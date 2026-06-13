@@ -41,15 +41,28 @@ The consequence for manufacturers is a feedback loop that has never before exist
 
 When the compiler compiles a circuit it does not only produce executable code. It produces a complete, static, ahead-of-time picture of everything the circuit will ever use during its lifetime. This profile is part of the manifest — the bitstream the runtime loads.
 
-**Port utilisation timeline.** For every channel the circuit subscribes to, the compiler knows exactly when it reads and when it writes: which tick within which window, at what frequency, producing or consuming what type. The profile is a timeline, not a set of bounds:
+**Port utilisation timeline.** For every channel the circuit subscribes to, the compiler knows exactly when it reads and when it writes: which tick within which window, at what frequency, producing or consuming what type. The profile is a timeline, not a set of bounds (the 847-tick window is the `budget_ticks` proved by the execution window profile below):
 
 ```
-channel  channel RawMessage   read    tick 0    of every 12-tick window  (consumer)
-channel  channel Price        write   tick 10   of every 12-tick window  (producer)
-channel  channel HandoffLatency write tick 11   of every 12-tick window  (observability)
+channel  RawMessage   read    tick   0   of every 847-tick window  (consumer)
+channel  Price        write   tick 843   of every 847-tick window  (producer)
+channel  HandoffLatency write tick 846   of every 847-tick window  (observability)
 ```
 
 The runtime loads this profile and hands it to the observability sub-circuit, which uses it as the baseline: if a read or write does not appear at the declared tick, the deviation is itself an observable event. The port utilisation data the observability sub-circuit reports is not sampled — it is the delta between the declared timeline and the measured one.
+
+**Execution window profile.** For every circuit and every function it calls, the compiler walks the full instruction graph, counts CLKIN cycles, adds pipeline drain depth, and emits an exact `budget_ticks` value. This is the window the runtime allocates in the dispatch table:
+
+```
+window   circuit  RiskCheck        period = 1ms    budget_ticks = 847   pipeline_depth = 4   core = 1
+window   fn       validate         budget_ticks = 312   pipeline_depth = 3   (called from RiskCheck)
+window   fn       computeRisk      budget_ticks = 489   pipeline_depth = 4   (called from RiskCheck)
+window   fn       writeResult      budget_ticks =  46   pipeline_depth = 1   (called from RiskCheck)
+```
+
+The circuit's `budget_ticks` is the sum of every function's cycle count plus the deepest pipeline drain across the call chain, proved by the compiler to be non-overlapping. If the sum exceeds the window implied by `period` — that is, if the function body takes more cycles than the declared recurrence period permits — it is a compile error. The programmer either shortens the function, widens the period, or splits the work across multiple circuits. No runtime measurement resolves this; the proof is either in the manifest or it does not compile.
+
+Every function called within a circuit is inlined or its call overhead is accounted for in the budget. There are no dynamic dispatch costs. There are no virtual method tables, no closure allocations, no GC pauses mid-window. The compiler sees a static call graph and counts cycles across it. The manifest records the result. The runtime allocates exactly `budget_ticks` cycles for the circuit's window — no more, no less.
 
 **Memory footprint by tier.** For every value the circuit declares, the compiler knows its type, its tier, its size in bytes, and its scope:
 
