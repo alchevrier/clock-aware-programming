@@ -1329,6 +1329,24 @@ The effective dispatch table occupancy at any moment is bounded by the number of
 
 The `max_circuit_slots` declaration therefore does not bound performance — it bounds the worst-case OS data structure size and the worst-case L1 footprint check. The actual runtime occupancy is determined by the arrival rate of data at chain heads, which is a property of the workload, not of the system configuration. The system is sized for the declared maximum; it operates at the workload's natural occupancy, which is always less.
 
+The epoch period of the chain head determines how much time the dispatch table has between bursts. Two workloads at opposite ends of the spectrum:
+
+```
+  HFT packet processing (10 Gbps NIC):
+    Frame period:    1.2 µs  =     4,800 ticks at 4 GHz
+    Chain cost:      ~200 ticks (parsePrice → updateBook → emitQuote)
+    Empty ticks:     4,600 ticks per epoch
+    Occupancy:       ~4%
+
+  Video game at 60 FPS (frame-capped):
+    Frame period:    16.67 ms = 66,680,000 ticks at 4 GHz
+    Chain cost:      ~8 ms    = 32,000,000 ticks (physics + AI + render)
+    Empty ticks:     34,680,000 ticks per frame
+    Occupancy:       ~48%
+```
+
+The video game case is instructive precisely because it is the hardest case for occupancy — yet even there the dispatch table is empty for more ticks than it is occupied. The frame cap is a declared epoch period: `@Timeslice(period = "16.67ms")` on the frame-head circuit. Every tick of that 16.67 ms is accounted for at compile time. The runtime knows that for the next 34 million ticks after the frame pipeline completes, no frame-chain circuit can fire. It uses that window to run background circuits — asset streaming, audio mixing, network state updates — at their own declared periods, filling the idle ticks with declared work rather than spinning. The dispatch table is never full because the chain head's epoch period guarantees a known-empty interval after every burst, and the compiler schedules background work into that interval explicitly. The frame cap is not a performance limit. It is a scheduling declaration that gives the compiler a provably large idle window to work with.
+
 Cores 1–N run application circuits exclusively. Their L1 holds only circuit data — declared channel buffers, task-tier values, the working set the compiler proved fits. No runtime data structure ever touches their cache. No dispatch loop instruction ever runs on them. They receive a single ACP cache-line EXECUTE signal from core 0 at the start of each window, execute their declared instruction sequence, and return to `STANDBYWFI`. Their entire L1 budget belongs to the application.
 
 ```
