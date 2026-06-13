@@ -1273,6 +1273,36 @@ A proof that omits the runtime's footprint is not a proof — it is an optimisti
 
 This is a natural application of the hot/cold core split already in `system.cap`. The runtime declares itself on a cold core the same way any other circuit is placed — `@Timeslice(core = 0, ...)` for the runtime dispatch loop, `@Timeslice(core = 2, ...)` for the hot-path circuits. The compiler re-runs the L1 footprint check with the runtime footprint removed from the hot core's capacity equation. If the hot-path working set now fits in L1 alone, `hot_path_dram_loads: 0` is restored. The proof holds again, at the cost of one cold core dedicated to runtime management — a cheap core, running at low frequency, doing a small fixed amount of work per tick.
 
+**The canonical topology: one OS core, N application cores.** The logical conclusion of this reasoning is a fixed core assignment declared in `system.cap`:
+
+```
+system.cores.os  = [0]          // one dedicated OS core
+system.cores.app = [1, 2, 3, 4] // all remaining cores: application circuits only
+```
+
+Core 0 runs everything the OS needs: `ClockCircuit`, `MemoryCircuit`, `NicCircuit`, `ObservabilityCircuit`, the runtime dispatch loop, `early_fire` flag scanning, power mode management, prefetch issuance, ACP EXECUTE signals to application cores. Its L1 holds all runtime state. It runs at `Efficiency` frequency — counter reads, flag scans, and management signals do not require 4 GHz.
+
+Cores 1–N run application circuits exclusively. Their L1 holds only circuit data — declared channel buffers, task-tier values, the working set the compiler proved fits. No runtime data structure ever touches their cache. No dispatch loop instruction ever runs on them. They receive a single ACP cache-line EXECUTE signal from core 0 at the start of each window, execute their declared instruction sequence, and return to `STANDBYWFI`. Their entire L1 budget belongs to the application.
+
+```
+  core 0 (OS core, Efficiency)          cores 1–N (app cores, Performance)
+  ┌────────────────────────────┐        ┌──────────────────────────────┐
+  │  WATCH loop (spinning)     │        │  STANDBYWFI                  │
+  │  dispatch table            │        │  (waiting for EXECUTE signal) │
+  │  early_fire flag scan      │        │                              │
+  │  ClockCircuit              │        │                              │
+  │  MemoryCircuit             │──ACP──►│  EXECUTE circuit window      │
+  │  NicCircuit                │signal  │  (pure circuit data in L1)   │
+  │  ObservabilityCircuit      │        │                              │
+  │  prefetch issuance         │◄─ACP──│  window close delta write    │
+  │  power mode management     │        │  back to observability buf   │
+  └────────────────────────────┘        └──────────────────────────────┘
+```
+
+This topology eliminates the last source of interference between the OS and application circuits. It is not a heuristic — it is a structural separation declared in `system.cap` and enforced by the compiler. An application circuit assigned to an OS core is a compile error. A runtime data structure allocated in an application core's L1 region is a compile error. The boundary is hard, proved, and permanent.
+
+The stalling risk disappears entirely. A stall on an application core can only come from that core's own instruction sequence — and the compiler already proved the instruction count fits in the declared budget. There is no OS noise, no runtime interrupt, no management access that can land on that core. The application core is an execution unit. The OS core is the controller. They communicate through one declared channel: the ACP EXECUTE signal. Everything else is isolated by construction.
+
 ### The Runtime Adapts — AI-Regulated OS
 
 The atom stream, the ML execution planner, and the clock model assignment together form a system that adapts in real time to the actual workload — not by guessing, not by sampling, but by reading a hardware-sourced proof stream and acting on it within the constraints of the compiler's theorems.
