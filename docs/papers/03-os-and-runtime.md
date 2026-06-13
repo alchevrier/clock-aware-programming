@@ -263,6 +263,18 @@ This means the return type of a circuit, as a whole, is always a channel write s
 
 **A circuit is therefore exactly: channels in, channels out.** Its type signature at the system level is the set of channels it reads and the set of channels it writes. Nothing else. The internal computation — the registers manipulated, the stack frames allocated, the functions called — is invisible to every other circuit and invisible to the runtime. The runtime knows only the window boundary and the channel writes that happen at declared positions within it. This is not an analogy to functional programming or dataflow graphs; it is a direct consequence of the window model. Because no value can leave a circuit except through a channel write, and no value can enter a circuit except through a channel read, a circuit's entire observable behaviour is its channel profile. Two circuits with identical channel profiles are indistinguishable to the system — which is exactly the substitutability property needed for live circuit swap, versioned upgrades, and compile-time composition checks.
 
+**The keyword `channel` disappears from the circuit signature.** Because every parameter a circuit receives is a channel read and every value it produces is a channel write, the compiler can infer the channel from the function signature alone. The programmer writes:
+
+```
+circuit RiskCheck {
+    fn run(msg: RawMessage) -> Price { ... }
+}
+```
+
+The compiler sees `msg: RawMessage` — a value crossing a circuit boundary at window open — and allocates a `channel RawMessage` with the tier, size, and access pattern derived from the declared type and the circuit's `@Timeslice`. It sees `-> Price` — a value crossing a circuit boundary at window close — and allocates a `channel Price` on the same basis. The explicit `channel` declarations are needed only when the programmer wants to override the defaults: a non-standard size, a specific tier, a custom access pattern, or a multi-producer topology. In the common case, the signature *is* the channel declaration. The wire is inferred from the connection.
+
+This is why the named `channel` block exists as an escape hatch rather than a requirement. `channel PriceTable { val size = 1024; fn writeAccessPattern(...) = ... }` is the programmer saying: *this channel has structure the compiler cannot infer from the type alone*. A plain `-> Price` in a circuit signature is the programmer saying: *one element, one producer, one consumer, default tier — you figure out the rest*. Both are channels. Only one needs to be written.
+
 ### Handoff: Declared Cycle Boundaries, Not Locks
 
 OS circuits communicate by writing to declared registers or memory locations at declared cycle boundaries. Circuit A writes at cycle N. Circuit B reads at cycle N+1. The compiler accounts for the timing of the handoff: it knows A's write cycle and B's read cycle, and proves that B's read is scheduled strictly after A's write. No synchronisation primitive is needed — the timing proof is the synchronisation.
