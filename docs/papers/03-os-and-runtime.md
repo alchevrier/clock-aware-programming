@@ -1296,6 +1296,20 @@ The compiler computes the total footprint of these structures — determined by 
 
 The `early_fire` flag array is the most latency-sensitive element. It is scanned on every WATCH iteration and its result determines IRQ response time. A flag array that spills to L2 adds L2 latency — typically 4–12 ticks — to every scan. On a 4 GHz core that is 1–3 ns added to the worst-case IRQ response bound, which the compiler reports as a change to the proved `irq_response_ticks` constant in the manifest. Nothing is hidden. The footprint is declared. The latency consequence is computed. The programmer sees both.
 
+**Every OS data structure is a fixed-size array.** This is not a design choice — it is an inevitable consequence of the declaration model. Because every resource in the system is declared in `system.cap` with a known count and a known element size, every OS data structure has a compile-time constant size. There are no dynamic allocations in the OS. There are no linked lists with unknown length. There are no hash maps that resize. There are no growable buffers.
+
+| OS data structure | Size derivation | Element size |
+|---|---|---|
+| Dispatch table | `max_circuit_slots × window_entry_size` | 32B |
+| `early_fire` flag array | `max_circuit_slots ÷ 8` (1 bit per slot) | — |
+| Manifest registry | `max_circuit_slots × manifest_record_size` | 128B |
+| Observability delta buffer | `declared in system.cap` | 8B (one Tick) |
+| ACP EXECUTE signal buffer | `app_core_count × cache_line_size` | 64B |
+| Key ring | `max_keys × key_size` | 32B |
+| Core power state table | `core_count × 1B` | 1B |
+
+Every size in that table is a product of two compile-time constants from `system.cap`. The compiler knows the total byte count of the entire OS before emitting a single instruction. The L1 footprint check is integer arithmetic over known constants. The result is either "fits" or "does not fit by N bytes" — not a measurement, not a profile, not a heuristic. A theorem over declarations.
+
 Cores 1–N run application circuits exclusively. Their L1 holds only circuit data — declared channel buffers, task-tier values, the working set the compiler proved fits. No runtime data structure ever touches their cache. No dispatch loop instruction ever runs on them. They receive a single ACP cache-line EXECUTE signal from core 0 at the start of each window, execute their declared instruction sequence, and return to `STANDBYWFI`. Their entire L1 budget belongs to the application.
 
 ```
