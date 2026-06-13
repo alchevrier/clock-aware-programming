@@ -1447,6 +1447,36 @@ The clock-aware model starts from the truth. Every circuit is event-driven: it e
 
 A lock is a runtime mechanism for enforcing what the clock-aware model enforces at compile time: that at any given moment, exactly one piece of code has access to a given value. The difference is that the clock-aware compiler proves this statically, for every value in the system, before a single instruction is emitted. The programmer never writes a lock because the compiler has already guaranteed that no two circuits can conflict — by construction, from the declarations. The sequentiality that locks were invented to enforce is the model, not an afterthought.
 
+### Why OOP Made This Worse — and Why Message-Passing Almost Solved It
+
+Object-oriented programming deepened the problem by hiding state mutation behind method calls. An object holds state. A method mutates it. Another method reads it. The sequence of calls across object boundaries determines the sequence of state changes — but that sequence is never declared. It is implicit in the call graph, reconstructed at runtime by whoever happens to call what in whatever order. The compiler sees individual method bodies. It does not see the global mutation sequence. Nobody sees it, because it was never written down.
+
+The result is that the happens-before relationship between any two state accesses in a large OOP codebase is unknowable by inspection. The programmer cannot look at two reads and determine, statically, which write each will observe. The compiler cannot determine it either. The language specification therefore introduces a **memory model**: a set of rules defining which orderings the compiler is permitted to assume, which it must preserve, and which it may reorder for optimisation. The programmer must reason about the memory model to write correct concurrent code. The memory model exists entirely because the sequence of mutations was never declared.
+
+The irony is that the same programmer, when writing a TCP server or a Kafka consumer, finds the ordering problem completely natural. A TCP stream delivers bytes in order. A Kafka partition delivers messages in order. Causality is explicit: the sender wrote the message before the receiver read it — by construction, from the protocol. The happens-before relationship is not inferred from a memory model; it is guaranteed by the channel. The programmer does not think about orderings on the wire because the wire declares them.
+
+The clock-aware model brings the channel inside the program. Every value moves through a declared channel. A channel has exactly one writer and one or more readers. The writer's window ends before the reader's window begins — the coherency gap is a compile-time constant, proved by Pass 1 of the compiler. The happens-before graph is the channel graph. It was declared by the programmer when she named the channel. The compiler does not infer it. It verifies it.
+
+**The consequence is that no memory model is needed.** A memory model exists to constrain what an optimising compiler may reorder across thread boundaries. In the clock-aware model there are no thread boundaries — only window boundaries, which are declared. The compiler emits instructions in declaration order within each window. Between windows on the same core, register forwarding transfers values directly through the pipeline. There is no reordering ambiguity because there is no concurrency to create ambiguity. The instructions are ordered. The channels are ordered. The cores are in-order processors executing declared sequences.
+
+```
+  OOP mutation sequence:
+  methodA() → object.field = x        (write)
+  methodB() → y = object.field        (read)
+  Question: does B see A's write?
+  Answer: depends on thread scheduling, memory model, fence placement
+          → unknowable by inspection, requires runtime memory model
+
+  Clock-aware channel sequence:
+  circuit A window [tick 0–200]  → writes channel C
+  circuit B window [tick 210–400] → reads channel C
+  coherency gap: 10 ticks (compile-time constant, Pass 1 verified)
+  Question: does B see A's write?
+  Answer: yes, proved. By construction. Before the first instruction was emitted.
+```
+
+Dispatching all circuits in a chain to the same core on an in-order processor is the final simplification. An in-order processor executes instructions in the order they are issued. Registers forwarded between windows are already in the pipeline. L1 loads hit in a fixed number of ticks counted by `llvm-mca`. There are no out-of-order reorderings to reason about, no store buffer drains to fence, no coherency protocol messages to wait for. Correctness is a consequence of declaration order and instruction order being the same thing. The memory model was the patch applied to a system where those two things had come apart. Reattach them and the patch is unnecessary.
+
 Cores 1–N run application circuits exclusively. Their L1 holds only circuit data — declared channel buffers, task-tier values, the working set the compiler proved fits. No runtime data structure ever touches their cache. No dispatch loop instruction ever runs on them. They receive a single ACP cache-line EXECUTE signal from core 0 at the start of each window, execute their declared instruction sequence, and return to `STANDBYWFI`. Their entire L1 budget belongs to the application.
 
 ```
