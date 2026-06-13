@@ -1885,6 +1885,73 @@ Compiler derivation table — what the compiler proves from this single annotati
 
 `@Handoff` is not required — a `channel T` subscription already declares the connection. `@Handoff` is the programmer's way of asserting stronger properties — named ownership, staleness bounds, placement hints — that the compiler then verifies. It is an annotation that adds proof obligations, not one that relaxes them.
 
+### The Channel Model Forces Temporal Honesty
+
+A consequence of the channel model that is easy to underestimate: **you cannot pretend that a network call is instantaneous.** In a conventional system, a programmer writes `response = await tcp_call(request)` — and the language allows it. The call may block for 50 ms. The thread sleeps, wakes, and continues. The temporal gap is hidden by the `await` keyword. The programmer's mental model is: I asked, I received. The actual model is: I asked, the thread was destroyed and recreated, and 50 ms later a different execution context received.
+
+In the clock-aware model, there is no `await`. A circuit sends a request by writing to a `session`-tier TCP channel. It closes its window. The response, when it arrives, writes into a `channel TcpResponse`. A *separate circuit* — subscribed to `channel TcpResponse` — handles it at the next period boundary where data is available. The programmer cannot write a single circuit that sends and then waits. The model does not allow it. Waiting is not an operation in a window model; it is an absence of data in a channel.
+
+This forces the programmer to declare the temporal structure of the operation explicitly:
+
+```
+circuit OrderSender {
+    fn send(order: Order) -> () =
+        OrderStream.put(order)     // write to TCP-backed channel; window closes
+}
+
+circuit OrderAck {
+    fn onAck(ack: TcpResponse) -> AckResult =  // fires when response channel has data
+        match ack {
+            Accepted(id)   => log(id)
+            Rejected(code) => handleRejection(code)
+            Timeout        => handleTimeout()    // declared timeout channel fires separately
+        }
+}
+```
+
+The timeout is not a `try/catch` around a blocking call. It is a `channel Timeout` written by the `ClockCircuit` when the declared maximum response window expires. The `OrderAck` circuit subscribes to both `channel TcpResponse` and `channel Timeout` — whichever fires first is handled, and the match is exhaustive. The compiler refuses to compile an `OrderAck` that does not handle the timeout case. There is no way to write code that silently hangs waiting for a TCP response. The language structure makes hanging unexpressible.
+
+### Two-Phase Locking Reduces to Channel State
+
+The same temporal honesty makes distributed coordination trivially correct. A two-phase commit or two-phase lock in a conventional system requires a state machine, a timer, a timeout handler, a recovery path for coordinator failure, and careful consideration of all the intermediate states a participant can be in when a crash occurs. The complexity is not incidental — it comes from not knowing when things happen.
+
+In the clock-aware model, a two-phase lock is a `session`-tier boolean channel:
+
+```
+channel TransactionLock {
+    val element = LockState     // Unlocked | Locked(txId) | Committed | Aborted
+    val tier    = session
+    val size    = 1
+}
+
+circuit PhaseOne {
+    fn acquire(req: LockRequest) -> LockState =
+        TransactionLock.put(Locked(req.txId))   // set lock; window closes
+}
+
+circuit PhaseTwo {
+    fn commit(decision: CommitDecision) -> LockState =   // fires when PhaseOne has written
+        match decision {
+            Commit => TransactionLock.put(Committed)
+            Abort  => TransactionLock.put(Aborted)
+        }
+}
+
+circuit ResourceGuard {
+    fn onLockChange(state: LockState) -> () =   // subscribes to TransactionLock
+        match state {
+            Locked(txId)  => denyOtherRequests(txId)
+            Committed     => applyAndRelease()
+            Aborted       => rollbackAndRelease()
+            Unlocked      => acceptRequests()
+        }
+}
+```
+
+`PhaseOne` writes `Locked` to `TransactionLock` and closes its window. `ResourceGuard` fires on the next period boundary, sees `Locked`, and begins denying competing requests — without any polling, without any mutex, without any kernel syscall. `PhaseTwo` fires when its input channel (the coordinator's decision) has data. It writes `Committed` or `Aborted` to `TransactionLock`. `ResourceGuard` fires again, sees the final state, and releases. Each transition is a channel write at a declared window boundary. Each handler is a circuit that fires exactly when data is available and never runs when it is not.
+
+The timeout case — coordinator failure — is `channel Timeout` firing because `PhaseTwo`'s window was skipped too many times. The `ResourceGuard` match handles `Timeout` the same way it handles `Aborted`: rollback and release. There is no separate recovery thread, no lease renewal daemon, no heartbeat protocol. The clock is already in the model. The programmer declares the maximum wait in `system.cap` and the `ClockCircuit` writes the signal when it expires.
+
 ### Cryptographic Circuit Identity
 
 Every compiled circuit manifest is signed with the organisation's private key before deployment. The signature covers the circuit's declared timing, lifetime types, channel subscriptions, and `@Handoff` declarations — the complete proof payload. The runtime verifies the signature before slotting the circuit into the dispatch table. An unsigned manifest, or one signed by an unknown key, is rejected at the dispatch boundary before any window is allocated, before any channel subscription is registered.
