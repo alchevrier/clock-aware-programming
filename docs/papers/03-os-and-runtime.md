@@ -2136,6 +2136,31 @@ The simplification is not cosmetic. The 30 million lines in the Linux stack exis
 
 Declare everything and the layers collapse.
 
+### Why the Runtime Itself Is Not Complicated
+
+All of the sophistication described in this paper — application-level pipelining, window budget proofs, admission control, channel graph scheduling, IRQ promotion — lives in the compiler and the manifest. By the time the runtime runs, every hard question has already been answered. The runtime does not solve problems. It executes pre-computed answers.
+
+The runtime's core loop, stripped of annotations, is:
+
+```
+loop {
+    tick = read_counter()                        // one register read
+    if tick >= dispatch_table[i].start_tick {    // one integer comparison
+        if channel[i].has_data() {               // one atomic flag read
+            execute(dispatch_table[i].circuit)   // jump to compiled code
+            i += 1
+        }
+    }
+    if dispatch_table[i].early_fire {            // one flag read
+        promote(i)                               // one table swap
+    }
+}
+```
+
+That is the scheduler. There is no priority queue. There is no run queue. There is no sleep queue. There is no wait queue. There is no timer wheel. There is no CFS red-black tree. There is no preemption logic. There is no context-switch save/restore. There is no `schedule()` function with 800 lines of policy. The dispatch table was computed by the compiler from the manifest sums. The runtime reads it. Every complexity that appears in a traditional scheduler exists because the scheduler does not know task duration, task frequency, or task data availability at the time it must decide. The runtime knows all three — they are in the manifest. Given that knowledge, the scheduler is a counter read and an array walk.
+
+The compiler is the complex artifact. It walks instruction graphs, models pipeline stages, proves memory tier footprints, validates channel type compatibility, solves the constraint system, and signs the manifest. That is where the intelligence lives — and it runs once, offline, on the developer's machine. The runtime is the simple artifact: it reads a proof and acts on it, at hardware speed, every tick, without deliberation.
+
 ### Why This Matters for Correctness
 
 Complexity is not just an engineering cost — it is a correctness risk. Every interaction between layers is a potential invariant violation. Every abstraction boundary is a place where a correct component can be composed incorrectly with another correct component. The Linux kernel has 30 million lines because the interactions are genuinely complex — and it has tens of thousands of CVEs because the interactions are genuinely complex.
