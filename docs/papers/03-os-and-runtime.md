@@ -245,6 +245,16 @@ There is no privileged mode at the language level. The distinction between an OS
 
 This is what makes the model tractable. In an electronic circuit, debugging is possible because every signal is observable — you attach a probe to the wire and read what flows through it. In a conventional software system, debugging is difficult because the interactions between components are not on wires — they are implicit in call stacks, shared memory layouts, and protocol conventions that were never formally specified. The clock-aware model puts every interaction back on a wire, gives it a name, gives it a type, and lets the compiler and the `ObservabilityCircuit` probe it continuously. Any channel can be subscribed to by the observability sub-circuit. Any value that ever flowed through it is in the atom log. The probe is always attached.
 
+**A channel is also a physical allocation decision.** The wire metaphor describes the logical property — one writer, declared readers, typed values, no other path. The backing store is a separate, orthogonal decision made by the compiler from the declared tier and the declared timing. The same channel declaration can be physically realised as:
+
+- A **hardware register** — if the channel element type fits in a machine word, the writer and reader share the same core, and the access pattern is within the same window. No memory bus involved. Zero-cycle transfer.
+- An **L1 cache line** — if the channel is `ephemeral` or `task` tier, the writer and reader are on the same core or adjacent cores within the same cache domain, and the declared access tick falls within L1 residency. The compiler pins the channel's ring buffer to a fixed cache line address and guarantees it is not evicted between writer and reader windows.
+- An **L2 cache region** — if the channel crosses a core boundary within the same socket and the declared `rtt_ns` is compatible with L2 latency. The compiler inserts a coherency gap of the declared cost into the dispatch table between the writer's window close and the reader's window open.
+- A **DRAM-backed ring buffer** — if the channel is `session` or `permanent` tier, or if the declared size exceeds L2 capacity. The compiler pre-allocates the buffer at system start and proves the producer write rate fits the consumer read period without overflow.
+- A **network-backed buffer** — if the channel has `backing = tcp` or `backing = rdma` declared in `system.cap`, bridging circuits on separate machines. The channel abstraction is identical from the circuit's perspective; only the declared latency numbers change.
+
+The programmer declares one thing: `channel PriceTable { val element = Price; val tier = task; val size = 1024; ... }`. The compiler resolves the physical backing from the tier, the size, the access pattern, and the machine model. The circuit code reads and writes channel elements — it never addresses memory directly, never specifies cache levels, never touches a DMA descriptor. The channel is the abstraction that makes the wire metaphor physically real: one name, one declaration, one proof obligation — backed by whatever physical medium the compiler determines is correct for the declared timing.
+
 ### Handoff: Declared Cycle Boundaries, Not Locks
 
 OS circuits communicate by writing to declared registers or memory locations at declared cycle boundaries. Circuit A writes at cycle N. Circuit B reads at cycle N+1. The compiler accounts for the timing of the handoff: it knows A's write cycle and B's read cycle, and proves that B's read is scheduled strictly after A's write. No synchronisation primitive is needed — the timing proof is the synchronisation.
@@ -753,7 +763,7 @@ The runtime's dispatch loop is a finite state machine. Four states repeat every 
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-**WATCH — Between windows.** The runtime never truly idles. It spins continuously on the hardware counter (`CNTVCT_EL0` / `RDTSC`), reading it on every iteration of the dispatch loop. On each iteration it also scans the dispatch table for `early_fire` flags set by incoming `channel IrqSignal` writes. This scan cannot be deferred — deferring it would delay IRQ response by however long the runtime slept, defeating the nanosecond latency guarantee. The runtime has no sleep state. Between windows it uses every tick productively: issuing exact prefetches for the next circuit's declared memory footprint, pre-conditioning the `cpu_model` frequency for a declared burst, and managing cores with no assigned circuit this window — placing them in `STANDBYWFI` (which wakes on the next timer tick, not on an OS wakeup call) or pre-warming their caches. `STANDBYWFI` is not sleep in the OS sense: the core halts instruction retirement but the runtime's counter-read loop resumes the instant the next declared window tick arrives. The hardware wakes it; the runtime was already waiting at the counter.
+**WATCH — Between windows.** The runtime's window closes and it becomes absent from execution — exactly like any other circuit with no pending data. It is subscribed to `channel ClockTick`. The hardware timer fires at the declared system tick rate, writes into `channel ClockTick`, and the runtime's next window opens. Between ticks the runtime generates no instructions and occupies no execution port. On cores with no circuit due this tick, the hardware is placed in `STANDBYWFI`, waking automatically on the next timer event. There is no spin. There is no idle loop. The runtime is absent between its own windows, just as application circuits are absent between theirs.
 
 **PLAN — Next window identified.** An `early_fire` flag is set, or the counter has reached the next scheduled window boundary. The runtime reads the dispatch table entry. Which circuit fires this window — the normally scheduled one, or an `early_fire` promoted circuit? The plan is not computed at this point — it was compiled. The runtime reads a static structure, not a dynamic queue.
 
@@ -2140,26 +2150,36 @@ Declare everything and the layers collapse.
 
 All of the sophistication described in this paper — application-level pipelining, window budget proofs, admission control, channel graph scheduling, IRQ promotion — lives in the compiler and the manifest. By the time the runtime runs, every hard question has already been answered. The runtime does not solve problems. It executes pre-computed answers.
 
-The runtime's core loop, stripped of annotations, is:
+The runtime is not a loop. It is a circuit — subscribed to `channel ClockTick`, exactly like every other circuit in the system. The hardware timer fires, writes a tick into `channel ClockTick`, and the runtime's window opens. The runtime reads the dispatch table, determines which circuit windows are due at this tick, checks whether their input channels have data, executes those that do, skips those that do not, records the delta, and closes its own window. Then it is absent until `channel ClockTick` fires again.
+
+Stripped of annotations, the runtime's window body is:
 
 ```
-loop {
-    tick = read_counter()                        // one register read
-    if tick >= dispatch_table[i].start_tick {    // one integer comparison
-        if channel[i].has_data() {               // one atomic flag read
-            execute(dispatch_table[i].circuit)   // jump to compiled code
-            i += 1
-        }
+on ClockTick {
+    entry = dispatch_table[next]                 // one array read
+    if entry.channel.has_data() {               // one atomic flag read
+        execute(entry.circuit)                   // jump to compiled code
+        next += 1
     }
-    if dispatch_table[i].early_fire {            // one flag read
-        promote(i)                               // one table swap
+    if dispatch_table[next].early_fire {         // one flag read
+        promote(next)                            // one table swap
     }
 }
 ```
 
-That is the scheduler. There is no priority queue. There is no run queue. There is no sleep queue. There is no wait queue. There is no timer wheel. There is no CFS red-black tree. There is no preemption logic. There is no context-switch save/restore. There is no `schedule()` function with 800 lines of policy. The dispatch table was computed by the compiler from the manifest sums. The runtime reads it. Every complexity that appears in a traditional scheduler exists because the scheduler does not know task duration, task frequency, or task data availability at the time it must decide. The runtime knows all three — they are in the manifest. Given that knowledge, the scheduler is a counter read and an array walk.
+That is the scheduler. There is no priority queue. There is no run queue. There is no sleep queue. There is no wait queue. There is no timer wheel. There is no CFS red-black tree. There is no preemption logic. There is no context-switch save/restore. There is no `schedule()` function with 800 lines of policy. The dispatch table was computed by the compiler from the manifest sums. The runtime reads it. Every complexity that appears in a traditional scheduler exists because the scheduler does not know task duration, task frequency, or task data availability at the time it must decide. The runtime knows all three — they are in the manifest. Given that knowledge, the scheduler is a channel read and an array walk.
 
-The compiler is the complex artifact. It walks instruction graphs, models pipeline stages, proves memory tier footprints, validates channel type compatibility, solves the constraint system, and signs the manifest. That is where the intelligence lives — and it runs once, offline, on the developer's machine. The runtime is the simple artifact: it reads a proof and acts on it, at hardware speed, every tick, without deliberation.
+The clock is not polled. It is declared. `channel ClockTick` is the hardware timer exposed as a first-class channel — the same mechanism by which any device signal enters the system. The runtime subscribes to it like any other consumer. This closes the model completely: there is no special-case boot loop, no privileged spin on a hardware counter, no OS-level idle task. The runtime is a circuit. The clock is a channel. Everything is consistent.
+
+The runtime is not purely stateless between `ClockTick` windows. It needs to remember two things: where it was in the dispatch table when its last window closed (`next_index` per core), and which circuits have pending `early_fire` flags set by incoming IRQ channel writes. These are not hidden mutable globals — they are the runtime's own `task`-tier declared state, part of its own manifest entry, allocated before the system starts and never resized. The runtime's manifest declares:
+
+```
+tier  task  size  <N × sizeof(DispatchEntry)>  scope  circuit   // dispatch table
+tier  task  size  <M × sizeof(u64)>            scope  circuit   // next_index per core
+tier  task  size  <K × sizeof(bool)>           scope  circuit   // early_fire flags
+```
+
+where N, M, and K are compile-time constants derived from `max_circuit_slots`, the number of app cores in `system.cap`, and the number of circuits that declare `channel IrqSignal` subscriptions. The runtime's memory footprint is bounded, proved, and pre-allocated — exactly like every other circuit's. The runtime is not exempt from the model. It is an instance of it.
 
 ### Why This Matters for Correctness
 
