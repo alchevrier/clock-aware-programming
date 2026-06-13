@@ -134,15 +134,17 @@ A `fn` is combinational logic — the gate, not the flip-flop. Its output is a s
 
 ```
 @Timeslice(core = 2, cycle = "4ns")
-fn parsePrice(in: channel RawMessage): channel Price =
-    channel.of(extract(in.get(consumerIndex)))
+fn parsePrice(msg: RawMessage) -> Price =
+    channel.of(extract(msg.get(consumerIndex)))
 ```
+
+The `channel` keyword does not appear in the signature. The compiler sees `RawMessage` crossing a circuit boundary at window open and infers a `channel RawMessage`; it sees `-> Price` crossing at window close and infers a `channel Price`. The explicit `channel` block is only needed when overriding defaults.
 
 Composition is plain function application — exactly as in circuit diagrams where you connect the output wire of one stage to the input wire of the next:
 
 ```
 @Timeslice(core = 2, cycle = "4ns")
-fn pipeline(raw: channel RawMessage): channel BookSnapshot =
+fn pipeline(raw: RawMessage) -> BookSnapshot =
     updateBook(parsePrice(raw))   // raw → prices → book
 ```
 
@@ -218,8 +220,8 @@ The type system detects this structurally. A path that uses a `cold T` type is a
 
 ```
 @Timeslice(core = 2, cycle = "4ns")
-fn parsePrice(in: channel RawMessage): channel Price {
-    val raw = in.get(consumerIndex);
+fn parsePrice(msg: RawMessage) -> Price {
+    val raw = msg.get(consumerIndex);
 
     return switch (raw.status) {
         case Ok(msg)    -> channel.of(extract(msg));          // hot path
@@ -235,7 +237,7 @@ Circuit equivalent:
                          ┌──────────────────────────────────────────────────┐
                          │  parsePrice — @Timeslice(cycle = 4ns)            │
                          │                                                  │
-  channel RawMessage ──►│ in.get()    ┌────────────┐                      │
+  channel RawMessage ──►│ msg.get()   ┌────────────┐                      │
   (input port)           │             │   switch   │ Ok                   │
                          │             │  raw.status├──────► extract() ───►│──► channel Price
                          │             │            │        (hot path)    │    (output signal)
@@ -402,10 +404,10 @@ circuit OrderBook {
     channel PriceTable bids: session    // internal channel — self-feeding state, circuit lifetime
     channel PriceTable asks: session
 
-    fn update(in: channel Fill): channel BookSnapshot =
-        snapshot(apply(in.get(consumerIndex), bids, asks))   // ALU: read state, transform, emit signal
+    fn update(fill: Fill) -> BookSnapshot =
+        snapshot(apply(fill.get(consumerIndex), bids, asks))   // ALU: read state, transform, emit signal
 
-    fn bestBid(): Price = bids.get(topKey)   // combinational read — output pin
+    fn bestBid() -> Price = bids.get(topKey)   // combinational read — output pin
 }
 ```
 
@@ -443,8 +445,8 @@ A `circuit` may also **return an internal channel** as its output signal — the
 circuit BestBidTracker {
     channel Price best: session   // self-feeding AND returned as output
 
-    fn track(in: channel Fill): channel Price {
-        val candidate = in.get(consumerIndex).price
+    fn track(fill: Fill) -> Price {
+        val candidate = fill.get(consumerIndex).price
         best = if candidate < best.get() { channel.of(candidate) } else { best }
         return best
     }

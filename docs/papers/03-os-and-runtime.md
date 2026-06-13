@@ -1005,7 +1005,7 @@ Every circuit window already has a start tick and an end tick — the hardware c
 @Measure("parsePrice")
 circuit ParsePrice {
     @Timeslice(core = 2, cycle = "4ns", budget = "3.5ns")
-    fn parse(frame: channel EthernetFrame) = ...
+    fn parse(frame: EthernetFrame) = ...
 }
 ```
 
@@ -1056,7 +1056,7 @@ The measurement infrastructure is not a library. It is the OS. The `Observabilit
 **Intra-window checkpoints.** If the full-window sample is insufficient and you need to locate where within a window the time is spent:
 
 ```
-fn parse(frame: channel EthernetFrame) = {
+fn parse(frame: EthernetFrame) = {
     val header  = parseHeader(frame)
     @Checkpoint("headerParsed")
     val decoded = decodePayload(header)
@@ -1078,7 +1078,7 @@ val p99Header      = percentile(headerSamples, 99.0)
 
 ```
 circuit ParsePriceAlert {
-    fn evaluate(samples: channel ParsePriceMeasurement) = {
+    fn evaluate(samples: ParsePriceMeasurement) = {
         val tail = percentile(samples, 99.9)
         match tail > budget * 0.9 {
             true  => AlertSignal.put(ParsePriceBudgetWarning { tail, budget })
@@ -2013,8 +2013,8 @@ channel SpiReading {
 
 circuit SpiSensor {
     @Timeslice(core = 1, period = "667ns", budget = "200ns")
-    fn read(in: channel SpiReading): channel ProcessedReading =
-        channel.of(process(in.get(0)))
+    fn read(reading: SpiReading) -> ProcessedReading =
+        channel.of(process(reading.get(0)))
 }
 ```
 
