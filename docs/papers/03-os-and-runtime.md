@@ -1369,6 +1369,28 @@ In the clock-aware model there is no context switch. There is only the dispatch 
 
 The single-core clock-aware system is faster than a multi-threaded conventional system for the same pipeline because it eliminates every source of inter-window overhead that multi-threading was supposed to hide. Multi-threading in a conventional OS exists to keep the CPU busy while one thread waits for I/O or memory. In the clock-aware model, the circuit is simply absent when its channel has no data — the core moves to the next dispatch table entry with no overhead. There is nothing to hide, nothing to overlap, nothing to context-switch around. The single core executes exactly what the compiler declared, in order, with the overhead the compiler counted, and nothing else.
 
+**The root cause multi-threading hides is the memory stall — and the clock-aware model eliminates the stall itself.** A conventional thread issues a load, misses L1, misses L2, and waits 100–300 ticks for DRAM. The scheduler switches to another thread to keep the CPU busy during that wait. The thread switch is not a solution — it is a compensation for a stall that should not have happened. The stall happened because the data was not in L1. The data was not in L1 because nobody knew the thread would need it until the instruction that needed it executed.
+
+The clock-aware model knows every memory access the next circuit will make before that circuit's window opens — from the manifest and the channel graph. It issues exact prefetches during the preceding WATCH ticks. By the time the circuit's first instruction executes, the data is already in L1. The stall never occurs. The compensation mechanism — thread switching — is therefore structurally unnecessary. There is no stall to hide.
+
+The OS-on-one-core topology reinforces this. The runtime's management accesses (dispatch table, flag array, manifest records) live exclusively in the OS core's L1. They never appear on an application core. An application core's L1 is entirely circuit data — the exact working set the compiler proved the circuit needs, pre-positioned by the runtime's prefetch, verified to fit by the compile-time footprint check. Every load the circuit issues hits L1. Every load was known in advance. Every load was already there.
+
+```
+  Conventional multi-threading:
+  thread issues load → L1 miss → L2 miss → DRAM wait (100–300 ticks)
+                                              ↓
+                                       scheduler switches thread
+                                       (compensates for the stall)
+
+  Clock-aware single core:
+  WATCH: runtime reads channel graph → issues prefetch for next circuit's data
+  EXECUTE: circuit's first load hits L1 (data already there)
+           stall: 0 ticks
+           thread switch: structurally impossible — there is no thread
+```
+
+This is why single-core clock-aware outperforms multi-threaded conventional for the same pipeline. Not because it runs faster instructions. Because it never stalls. A CPU that never stalls on memory has no need for thread switching to hide those stalls. The performance comes from eliminating the problem, not from compensating for it faster.
+
 Cores 1–N run application circuits exclusively. Their L1 holds only circuit data — declared channel buffers, task-tier values, the working set the compiler proved fits. No runtime data structure ever touches their cache. No dispatch loop instruction ever runs on them. They receive a single ACP cache-line EXECUTE signal from core 0 at the start of each window, execute their declared instruction sequence, and return to `STANDBYWFI`. Their entire L1 budget belongs to the application.
 
 ```
