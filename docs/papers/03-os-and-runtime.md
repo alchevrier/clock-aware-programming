@@ -1224,6 +1224,31 @@ This collapses the conventional trade-off between responsiveness and power. A co
 
 The CPU keeps itself maximally busy during declared busy periods — the dispatch table shows every instruction chain that will execute, the channel graph shows what data will flow through it, and the runtime pre-positions everything. Then, when the causal chain is exhausted and the next event is provably distant, it powers down to the minimum state that can still wake in time. The two structures together — temporal and causal — give the runtime complete knowledge of both when to work and when to rest, at tick-level precision, derived from declarations that were made before the first instruction executed.
 
+**The hot path may never touch DRAM.** With the full dependency graph and execution plan known at compile time, the compiler can prove that the entire hot-path pipeline fits in registers and L1 cache — and if it does, DRAM is structurally unreachable on that path. Not avoided by luck. Not avoided by careful programmer discipline. Unreachable by theorem.
+
+The proof is straightforward. For each value on the hot path, the compiler knows its declared lifetime tier (`register`, `ephemeral`, `task`) and its size. It knows L1 capacity and associativity from `system.cap`. It computes the total working set of the hot-path pipeline — every value that any circuit in the chain touches, from the first circuit to the last — and checks whether it fits:
+
+```
+  Hot path:  NicCircuit → parsePrice → updateBook → emitQuote
+
+  Working set per circuit:
+  NicCircuit:   channel EthernetFrame  (task tier, 1500B)   — arrives via DMA into L1
+  parsePrice:   channel Price          (register lifetime)  — stays in register file
+  updateBook:   channel OrderBook      (task tier, 128B)    — L1 pinned
+  emitQuote:    channel Quote          (register lifetime)  — register file → DMA out
+
+  Total L1 footprint: 1628B across four circuits
+  L1 capacity: 32KB (from system.cap)
+  Fits: yes — by 30KB
+  DRAM load count on hot path: 0 (proved)
+```
+
+The DMA delivers the incoming frame directly into `channel EthernetFrame`'s declared L1-pinned physical address. The first instruction of `parsePrice` reads from L1. Its output fits in a register. `updateBook` reads from the register, writes its result to an L1-pinned task-tier buffer. `emitQuote` reads from that buffer — still in L1 — and the DMA carries the result out. The CPU never issued a DRAM load. The memory bus was idle for the entire hot-path chain.
+
+The compiler detects when this proof holds and emits it into the manifest as a guarantee: `hot_path_dram_loads: 0`. The `ObservabilityCircuit` verifies it at runtime via the trace unit — a DRAM access on the hot path is a trace event, and a trace event on a path declared to have zero DRAM loads is an `ExecutionPlanViolation`. The guarantee is not aspirational. It is checked, continuously, in production.
+
+When the hot-path working set does not fit in L1 — a larger order book, a wider price table — the compiler falls back to L2, then declares which values must be demoted to `session` tier (DRAM). The programmer sees the compile-time footprint report. They can choose to split the circuit, reduce the working set, or accept the DRAM latency and widen the budget accordingly. The decision is explicit, informed by exact numbers, made before the system ships.
+
 ### The Runtime Adapts — AI-Regulated OS
 
 The atom stream, the ML execution planner, and the clock model assignment together form a system that adapts in real time to the actual workload — not by guessing, not by sampling, but by reading a hardware-sourced proof stream and acting on it within the constraints of the compiler's theorems.
