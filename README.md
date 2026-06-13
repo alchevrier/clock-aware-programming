@@ -67,7 +67,7 @@ When the OS is written in the same language, the runtime and kernel converge. Th
 - **AI-regulated OS** — the runtime adapts clock frequency, L1 pre-population, and core affinity using the compile-time dispatch table as lookahead. Speculative pre-conditioning, not reactive compensation.
 - **Native substrate for ML** — declared memory tiers, compile-time weight placement, channel-based tensor routing, GPU as mathematical circuit array.
 
-→ **[Paper III: The OS and Runtime](docs/papers/03-os-and-runtime.md)**
+→ **[Paper III: The OS and Runtime](docs/papers/03-os-and-runtime/index.md)**
 
 ---
 
