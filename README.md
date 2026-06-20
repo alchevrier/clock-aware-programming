@@ -95,25 +95,6 @@ That is not a product pitch. It is the description of what computing looks like 
 
 ---
 
-## Architecture Decision Records
-
-The ADRs record implementation decisions for the near-term Rust prototype (`Channel<T>` syntax, proc-macro annotations, `system.cap`, `cargo-timeslice`). The prototype is a research vehicle — a way to validate the four rules on existing hardware. The language described in the papers is a separate, later destination.
-
-| # | Title | Status |
-|---|---|---|
-| [0001](docs/adr/0001-naming-clock-aware-programming.md) | Naming: clock-aware programming | Accepted |
-| [0002](docs/adr/0002-cpu-partition-model.md) | CPU partition model (OS cores / app cores) | Accepted |
-| [0003](docs/adr/0003-rcu-elimination-via-compile-time-proofs.md) | RCU elimination via compile-time scheduling proofs | Accepted |
-| [0004](docs/adr/0004-rust-as-implementation-vehicle.md) | Rust as implementation vehicle | Accepted |
-| [0005](docs/adr/0005-unified-system-configuration.md) | Unified system configuration file | Accepted |
-| [0006](docs/adr/0006-poll-mode-self-regulating-network-stack.md) | Poll-mode self-regulating network stack | Superseded by 0010 |
-| [0007](docs/adr/0007-memory-ordering-elimination.md) | Memory ordering elimination via compile-time scheduling proofs | Accepted |
-| [0008](docs/adr/0008-clock-aware-memory-management.md) | Clock-aware memory management | Accepted |
-| [0009](docs/adr/0009-implied-hardware-architecture.md) | The implied hardware architecture | Speculative |
-| [0010](docs/adr/0010-channel-based-io.md) | Channel-based I/O — hardware signals as declared-timing channels | Accepted |
-
----
-
 ## Implementation Roadmap
 
 The prototype target is a **Raspberry Pi 3B+** — Cortex-A53 (ARMv8-A), 4 cores at 1.4GHz, bare metal. No Linux. No FPGA. The model runs on commodity hardware that anyone can buy for $35.
