@@ -162,15 +162,5 @@ The expertise required to operate these patterns in a conventional system is rea
 
 ---
 
-## Relation to the ADRs
-
-The ADRs in this repository record implementation decisions for a near-term Rust prototype: proc-macro annotations, `system.cap`, `channel T`, `cargo-timeslice`. That prototype is a research vehicle — a way to validate the scheduling model, the channel model, and the verification approach on existing hardware using existing toolchain infrastructure. It is not the OS described in this paper.
-
-The channel-based I/O model (ADR-0010) is the first instantiation of the unified I/O abstraction. The unified system configuration (ADR-0005) is the first instantiation of the hardware-model declaration. The CPU partition model (ADR-0002) is the first instantiation of the static dispatch table. These concepts carry forward directly into the runtime.
-
-Each ADR is a step toward understanding. This paper is the runtime destination.
-
----
-
-*Part of the clock-aware programming series. See [Paper I: Clock-Aware Programming](01-clock-aware-programming.md) for the core primitive. See [Paper II: The Language](02-language.md) for the language definition. See [Paper IV: Hardware Architecture Implications](04-hardware-architecture.md) for the silicon consequences.*
+*Part of the clock-aware programming series. See [Paper I: Clock-Aware Programming](../01-clock-aware-programming.md) for the core primitive. See [Paper II: The Language](../02-language.md) for the language definition. See [Paper IV: Hardware Architecture Implications](../04-hardware-architecture.md) for the silicon consequences.*
 

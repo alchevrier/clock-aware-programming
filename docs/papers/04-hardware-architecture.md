@@ -373,12 +373,4 @@ The device is not just a declared resource. It is a continuously measured, self-
 
 ---
 
-## Relation to ADR-0009
-
-ADR-0009 (The Implied Hardware Architecture) in this repository records the same observation in decision form: that the clock-aware software model implies a hardware architecture, and that the compounding value of the primitive lives in the hardware convergence rather than in the software optimisation alone. This paper expands that observation into a full analysis.
-
-The current implementation targets commodity x86-64 and AArch64 hardware — the near-term path is practical and does not require custom silicon. ADR-0009 and this paper describe the endpoint the model implies, not the starting point the implementation requires.
-
----
-
-*Part of the clock-aware programming series. See [Paper I: Clock-Aware Programming](01-clock-aware-programming.md) for the core primitive. See [Paper II: The Language](02-language.md) and [Paper III: The OS and Runtime](03-os-and-runtime.md) for the software stack consequences.*
+*Part of the clock-aware programming series. See [Paper I: Clock-Aware Programming](01-clock-aware-programming.md) for the core primitive. See [Paper II: The Language](02-language.md) and [Paper III: The OS and Runtime](03-os-and-runtime/index.md) for the software stack consequences.*

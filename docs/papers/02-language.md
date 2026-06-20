@@ -594,16 +594,4 @@ This is the model where AI-generated code becomes safe-to-ship in safety-critica
 
 ---
 
-## Relation to the ADRs
-
-The ADRs in this repository record implementation decisions for a near-term Rust prototype: proc-macro annotations, `system.cap`, `Channel<T>`, `cargo-timeslice`. That prototype is a research vehicle — a way to validate the four rules and the verification model on existing hardware using existing toolchain infrastructure. It is not the language described in this paper.
-
-The channel-based I/O model (ADR-0010) is the first instantiation of the unified I/O abstraction. The unified system configuration (ADR-0005) is the first instantiation of the hardware-model declaration. These concepts carry forward directly into the language.
-
-The Rust implementation path does not. The language described in this paper is designed from scratch, written in itself from Generation 1, with no Rust in the stack.
-
-Each ADR is a step toward understanding. This paper is the language destination.
-
----
-
-*Part of the clock-aware programming series. See [Paper I: Clock-Aware Programming](01-clock-aware-programming.md) for the core primitive. See [Paper III: The OS and Runtime](03-os-and-runtime.md) for the runtime and OS consequences. See [Paper IV: Hardware Architecture Implications](04-hardware-architecture.md) for the silicon consequences.*
+*Part of the clock-aware programming series. See [Paper I: Clock-Aware Programming](01-clock-aware-programming.md) for the core primitive. See [Paper III: The OS and Runtime](03-os-and-runtime/index.md) for the runtime and OS consequences. See [Paper IV: Hardware Architecture Implications](04-hardware-architecture.md) for the silicon consequences.*

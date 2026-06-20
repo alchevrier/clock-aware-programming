@@ -3,7 +3,7 @@
 
 > Static scheduling as a first-class language primitive: clock-aware annotations that let the compiler prove synchronisation unnecessary.
 
-**Started: 2026-06-07.** This paper records the core insight: declared operation timing as a compiler primitive, and the synchronisation, scheduling, and memory ordering machinery that becomes provably unnecessary when it is present. Implementation decisions are in the [ADRs](../adr/). The language consequences are in [Paper II](02-language.md). The OS and runtime consequences are in [Paper III](03-os-and-runtime.md). The hardware consequences are in [Paper IV](04-hardware-architecture.md).
+**Started: 2026-06-07.** This paper records the core insight: declared operation timing as a compiler primitive, and the synchronisation, scheduling, and memory ordering machinery that becomes provably unnecessary when it is present. The language consequences are in [Paper II](02-language.md). The OS and runtime consequences are in [Paper III](03-os-and-runtime/index.md). The hardware consequences are in [Paper IV](04-hardware-architecture.md).
 
 ---
 
@@ -205,27 +205,6 @@ Because the proc-macro checker runs as part of the normal build, any language se
 
 The Rust borrow checker already proves read/write exclusivity at compile time — the same invariant RCU enforces at runtime. Extending an existing proof system is feasible; building one from scratch is not. Lifetimes provide a natural hook for timeslice annotations: `'timeslice(N)` as a bound encoding "this reference is valid during cycle N on core K". The `rust-for-linux` project is an active community path to mainline kernel contribution.
 
-See [ADR-0004](docs/adr/0004-rust-as-implementation-vehicle.md) for the full decision.
-
----
-
-## Architecture Decision Records
-
-These ADRs form the whitepaper. Each records a single decision: the problem it solves, the constraints it operates under, the rationale, and the alternatives rejected.
-
-| # | Title | Status |
-|---|---|---|
-| [0001](docs/adr/0001-naming-clock-aware-programming.md) | Naming: clock-aware programming | Accepted |
-| [0002](docs/adr/0002-cpu-partition-model.md) | CPU partition model (OS cores / app cores) | Accepted |
-| [0003](docs/adr/0003-rcu-elimination-via-compile-time-proofs.md) | RCU elimination via compile-time scheduling proofs | Accepted |
-| [0004](docs/adr/0004-rust-as-implementation-vehicle.md) | Rust as implementation vehicle | Accepted |
-| [0005](docs/adr/0005-unified-system-configuration.md) | Unified system configuration file | Accepted |
-| [0006](docs/adr/0006-poll-mode-self-regulating-network-stack.md) | Poll-mode self-regulating network stack | Superseded by 0010 |
-| [0007](docs/adr/0007-memory-ordering-elimination.md) | Memory ordering elimination via compile-time scheduling proofs | Accepted |
-| [0008](docs/adr/0008-clock-aware-memory-management.md) | Clock-aware memory management | Accepted |
-| [0009](docs/adr/0009-implied-hardware-architecture.md) | The implied hardware architecture | Speculative |
-| [0010](docs/adr/0010-channel-based-io.md) | Channel-based I/O — hardware signals as declared-timing channels | Accepted |
-
 ---
 
 ## The Implied Hardware Destination
@@ -238,7 +217,7 @@ The freed die area — L2 and L3 together consume 50–70% of a modern CPU die; 
 
 The compounding gain comes from transistor scaling. As transistors shrink, every process node amplifies the freed area. An OOO CPU at 3nm is faster than at 5nm by a predictable factor. A clock-aware in-order CPU at 3nm is faster by a larger factor, because it reinvests *more* of the node's transistor budget into computation rather than prediction. The FPGA is the existence proof: FPGAs are in-order by construction, and every process generation has delivered gains directly into logic density and clock rate, not into prediction hardware.
 
-This is not a requirement for the software model — which works on Skylake today. It is the destination the model implies, and the reason the primitive has value that compounds rather than saturates. See [ADR-0009](docs/adr/0009-implied-hardware-architecture.md).
+This is not a requirement for the software model — which works on Skylake today. It is the destination the model implies, and the reason the primitive has value that compounds rather than saturates. See [Paper IV: Hardware Architecture Implications](04-hardware-architecture.md).
 
 ---
 
@@ -271,7 +250,7 @@ If yes to (2): reclaim. Immediately, at the boundary, with no grace period, no b
 
 In each domain, the current answer is a runtime mechanism (scheduler, priority system, WCET tool) that solves at runtime what declared timing would prevent at compile time.
 
-**Power consumption** is the natural concern with a model built on dedicated cores: a core running declared-timing circuits looks like a core that burns. The channel depth-driven budget adjustment (ADR-0010) is the direct answer. Under low load the circuit's declared cycle budget expands — the core is genuinely idle between executions, not spinning. The idle period is not a heuristic sleep or a timer interrupt guess; it is a compiler-known cycle count derived from the channel depth at the last boundary. The core executes again exactly when it declared it would, does exactly the work that was budgeted, and returns to idle. This is closer to a clock-gated circuit than to a busy-wait loop: activity is proportional to actual work, transitions are instantaneous at the cycle boundary, and the power envelope is as predictable as the timing envelope — because they are the same thing.
+**Power consumption** is the natural concern with a model built on dedicated cores: a core running declared-timing circuits looks like a core that burns. The channel depth-driven budget adjustment is the direct answer. Under low load the circuit's declared cycle budget expands — the core is genuinely idle between executions, not spinning. The idle period is not a heuristic sleep or a timer interrupt guess; it is a compiler-known cycle count derived from the channel depth at the last boundary. The core executes again exactly when it declared it would, does exactly the work that was budgeted, and returns to idle. This is closer to a clock-gated circuit than to a busy-wait loop: activity is proportional to actual work, transitions are instantaneous at the cycle boundary, and the power envelope is as predictable as the timing envelope — because they are the same thing.
 
 The mobile modem is a concrete example of the leverage. A modem is a real-time pipeline — channel decoding, demodulation, protocol state machines — running on dedicated DSP or application processor cores alongside the general-purpose OS. Today, power management for the modem is a stack of heuristics: radio frequency duty cycling, DRX (discontinuous reception) timers tuned per operator, proprietary firmware that the OS cannot inspect. The result is a permanently negotiated truce between latency and battery life, re-tuned for every chipset and every carrier. Under a clock-aware model, the modem pipeline declares its cycle budget per frame interval (e.g. every 1 ms LTE subframe). Between frame boundaries the cores are idle for a compiler-proven duration — not an estimated one. The radio wakes at the declared cycle, processes the frame within the declared budget, and returns to a known-idle state. Power draw becomes a compile-time output of the frame schedule, not a runtime measurement that firmware attempts to minimise after the fact. The same model that removes the Linux scheduler from a trading system removes the DRX heuristic from a modem.
 
@@ -340,7 +319,7 @@ This means the ceiling is not an empirical question. A declared `cpu_model` in `
 
 ### Preconditions eliminate the main sources of variance
 
-The preconditions in ADR-0002 are not arbitrary — they are specifically chosen because they are the conditions under which `llvm-mca` is most accurate:
+The preconditions  are not arbitrary — they are specifically chosen because they are the conditions under which `llvm-mca` is most accurate:
 
 | Source of variance | Precondition that eliminates it |
 |---|---|
@@ -356,7 +335,7 @@ Under all of these preconditions, `llvm-mca`'s prediction accuracy is as high as
 
 ### Runtime monitoring as the feedback loop
 
-The runtime configuration library (ADR-0005) closes the loop. The OS partition can observe actual execution times (via hardware performance counters: `PERF_COUNT_HW_INSTRUCTIONS`, `PERF_COUNT_HW_CPU_CYCLES`) and compare them against declared budgets. If actual cycles consistently exceed the declared budget, the system writes an updated budget via the config ring at the next cycle boundary — tightening the declared budget to match reality, or alerting the operator that the working set no longer fits in L1.
+The runtime configuration library closes the loop. The OS partition can observe actual execution times (via hardware performance counters: `PERF_COUNT_HW_INSTRUCTIONS`, `PERF_COUNT_HW_CPU_CYCLES`) and compare them against declared budgets. If actual cycles consistently exceed the declared budget, the system writes an updated budget via the config ring at the next cycle boundary — tightening the declared budget to match reality, or alerting the operator that the working set no longer fits in L1.
 
 This is not a violation of the compile-time proof; it is the monitoring layer confirming the proof's preconditions hold. If they do not hold (e.g., a cache miss appears because the working set grew beyond L1), the system self-reports the violation rather than silently producing incorrect timing behavior.
 
@@ -389,19 +368,19 @@ HLS for FPGAs is a particular kind of discipline. Even in a high-level synthesis
 
 Background reading:
 
-- Robert Love, *Linux Kernel Development* — RCU, locking, preemption chapters. The reference for the kernel internals analysis in ADR-0003.
+- Robert Love, *Linux Kernel Development* — RCU, locking, preemption chapters. The reference for the kernel internals analysis .
 - Paul McKenney, *Is Parallel Programming Hard, And, If So, What Can You Do About It?* — the authoritative treatment of RCU by its principal designer. The framing of RCU as deferred reclamation under reader/writer timing uncertainty is his.
 - Ulrich Drepper, *What Every Programmer Should Know About Memory* — cache hierarchy, TLB behaviour, NUMA topology, prefetcher mechanics. The reference for the memory partition and working set claims.
 - Agner Fog, *Microarchitecture* — the most detailed published treatment of CPU execution ports, instruction latency, and throughput per microarchitecture. The empirical basis for the claim that the theoretical ceiling is known and documented.
 - David Harris & Sarah Harris, *Digital Design and Computer Architecture* — the foundational reference for pipeline design, clock domain crossings, and synchronous circuit timing. The conceptual bridge between FPGA design discipline and the clock-aware programming model.
-- Scott Meyers, *Effective Modern C++* — the practical reference for modern C++ memory model semantics, `std::atomic`, move semantics, and the reasoning patterns that made the memory ordering analysis in ADR-0007 precise.
+- Scott Meyers, *Effective Modern C++* — the practical reference for modern C++ memory model semantics, `std::atomic`, move semantics, and the reasoning patterns that made the memory ordering analysis precise.
 
 ---
 
 ## Acknowledgements
 
 To Robert Love, Paul McKenney, Ulrich Drepper, Agner Fog, David and Sarah Harris, and Scott Meyers: your writing made the ideas in this repository possible. None of this would exist without the depth and rigour you put into work you made available.
-To Linus Torvalds and the Linux kernel maintainers: the kernel you built and keep building is the system this work proposes to improve. The fact that it is open, auditable, and understood well enough to reason about at the level of individual hot paths is itself a precondition for everything in these ADRs. The critical analysis here is the highest form of respect — you built something worth analysing.
+To Linus Torvalds and the Linux kernel maintainers: the kernel you built and keep building is the system this work proposes to improve. The fact that it is open, auditable, and understood well enough to reason about at the level of individual hot paths is itself a precondition for everything in this paper. The critical analysis here is the highest form of respect — you built something worth analysing.
 
 To Bjarne Stroustrup and the C++ standards committee: `low-latency-feed-handler` is C++23. The language gave the tools — concepts, ranges, `std::atomic`, the memory model — to build a system where the questions about timing became sharp enough to ask. The sharpness of the question is partly the language's doing.
 
