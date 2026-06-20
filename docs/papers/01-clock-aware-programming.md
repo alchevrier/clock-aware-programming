@@ -197,15 +197,10 @@ Feedback loop target:  write → IDE annotation (instantaneous)
 
 The goal is the same feedback loop a hardware engineer has in Vivado: timing violations are visible as you type, not discovered after a build.
 
-Because the proc-macro checker runs as part of the normal build, any language server (rust-analyzer) that invokes the build surfaces violations as red underlines in the editor — before a build is triggered, before a binary exists, before anything runs. A `#[timeslice]` annotation that exceeds its budget, a channel subscription that references an undeclared channel, a dependency whose timing contract is incompatible — all are compile errors, visible at edit time. The question "will this work at runtime?" is answered on every keystroke. The proof runs first; the binary is a consequence of the proof passing.
+Because the timing checker is the foundation of the language itself, the language server surfaces violations as red underlines in the editor — before a build is triggered, before a binary exists, before anything runs. A budget annotation that exceeds its limits, a channel subscription that references an undeclared channel, a dependency whose timing contract is incompatible — all are compile errors, visible at edit time. The question "will this work at runtime?" is answered on every keystroke. The proof runs first; the binary is a consequence of the proof passing.
 
 ---
 
-## Why Rust
-
-The Rust borrow checker already proves read/write exclusivity at compile time — the same invariant RCU enforces at runtime. Extending an existing proof system is feasible; building one from scratch is not. Lifetimes provide a natural hook for timeslice annotations: `'timeslice(N)` as a bound encoding "this reference is valid during cycle N on core K". The `rust-for-linux` project is an active community path to mainline kernel contribution.
-
----
 
 ## The Implied Hardware Destination
 

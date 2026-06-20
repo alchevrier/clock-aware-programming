@@ -54,7 +54,7 @@ This is the logical conclusion of making everything declared and everything obse
 Between an application and the silicon, the Linux stack today:
 
 ```
-C/C++/Rust application
+Conventional systems application
 + libc / stdlib
 + syscall interface
 + VFS / network stack / device drivers

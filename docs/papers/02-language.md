@@ -17,18 +17,18 @@ The answer is a language with four rules instead of four thousand pages — desi
 
 ## One Language
 
-The language comes first. Not Rust with annotations bolted on. Not an existing language extended with timing attributes. A new language whose entire surface is the clock-aware model — designed from the declarations down, not from a syntax up.
+The language comes first. Not an existing language extended with timing attributes. A new language whose entire surface is the clock-aware model — designed from the declarations down, not from a syntax up.
 
 The implementation path follows two generations:
 
 - **Generation 1** — the language is written and the compiler targets the language itself. The unavoidable hardware boundary — system calls, boot, hardware initialisation — is covered by a thin layer of Assembly stubs (~500 lines). Everything above the stubs is written in the language.
-- **Generation 2** — the compiler rewrites those Assembly stubs in the language itself, using `channel T` declarations to express what the stubs previously expressed in raw instruction sequences. The language becomes fully self-hosting. No assembly. No Rust. No foreign layer.
+- **Generation 2** — the compiler rewrites those Assembly stubs in the language itself, using `channel T` declarations to express what the stubs previously expressed in raw instruction sequences. The language becomes fully self-hosting. No assembly. No foreign layer.
 
 The stubs in Generation 1 are not a concession — they are the hardware boundary that cannot be abstracted away without first having a language capable of expressing it. Generation 2 is when the language proves it can.
 
 ### Four Rules
 
-Today's systems languages — C++, Rust — require the programmer to hold a large mental model simultaneously: ownership, lifetimes, borrow rules, unsafe boundaries, memory ordering semantics, async runtimes, move semantics, reference types. The complexity is not the price of expressiveness; it is the price of building on a foundation that does not know when things happen. Every rule in Rust's ownership system exists because the compiler does not know the relative timing of two accesses — so it must conservatively restrict them.
+Today's systems languages require the programmer to hold a large mental model simultaneously: ownership, lifetimes, borrow rules, unsafe boundaries, memory ordering semantics, async runtimes, move semantics, reference types. The complexity is not the price of expressiveness; it is the price of building on a foundation that does not know when things happen. Every rule in an ownership system exists because the compiler does not know the relative timing of two accesses — so it must conservatively restrict them.
 
 A language where every access cycle is declared has none of this uncertainty. The rules collapse to four:
 
@@ -505,7 +505,7 @@ A `circuit` is a clocked block with self-feeding channels. A `fn` is combination
 
 ### No Unsafe Escape Hatch
 
-The absence of `unsafe` is the strongest claim. In Rust, `unsafe` exists because the language model cannot express all valid programs without it: hardware access, FFI, pointer arithmetic. In the clock-aware language, all hardware access is through `channel T`. There is no raw pointer because there is no need for one — the channel model covers every hardware interaction, and the compiler knows the full channel graph from `system.cap`. There is nothing that `unsafe` would permit that the type system cannot already express.
+The absence of `unsafe` is the strongest claim. In existing systems languages, escape hatches exist because the language model cannot express all valid programs without them: hardware access, FFI, pointer arithmetic. In the clock-aware language, all hardware access is through `channel T`. There is no raw pointer because there is no need for one — the channel model covers every hardware interaction, and the compiler knows the full channel graph from `system.cap`. There is nothing that `unsafe` would permit that the type system cannot already express.
 
 A program that cannot be expressed without `unsafe` is a program that has not declared its timing. The solution is to declare it, not to escape the model.
 
